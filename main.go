@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sync"
 )
 
@@ -32,5 +33,14 @@ func (s *KVStore) Get(key string) (string, bool) {
 
 func main() {
 	store := NewStore()
-	_ = store
+
+	store.Set("CEO", "Ahammed Nibras")
+
+	value, ok := store.Get("CEO")
+
+	if ok {
+		fmt.Println("CEO:", value)
+	} else {
+		fmt.Println("Key not found")
+	}
 }
