@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"sync"
+	"time"
 )
 
 type KVStore struct {
@@ -49,5 +50,28 @@ func main() {
 		fmt.Println("CEO:", value)
 	} else {
 		fmt.Println("Key not found")
+	}
+
+	var wg sync.WaitGroup
+
+	for i := 0; i < 10; i++ {
+		i := i
+
+		wg.Add(1)
+
+		go func() {
+			defer wg.Done()
+
+			key := fmt.Sprintf("key%d", i)
+			val := fmt.Sprintf("value%d", i)
+			store.Set(key, val)
+		}()
+	}
+
+	wg.Wait()
+
+	fmt.Println("Final KVStore contents:")
+	for k, v := range store.data {
+		fmt.Println(k, "=", v)
 	}
 }
