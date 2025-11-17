@@ -1,9 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"sync"
-	"time"
 )
 
 type KVStore struct {
@@ -39,10 +40,58 @@ func (s *KVStore) Delete(key string) {
 	delete(s.data, key)
 }
 
+func (s *KVStore) GetAll() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	copyMap := make(map[string]string, len(s.data))
+
+	for k, v := range s.data {
+		copyMap[k] = v
+	}
+
+	return copyMap
+}
+
+func (s *KVStore) Save(filename string) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	jsonData, err := json.MarshalIndent(s.data, "", " ")
+	if err != nil {
+		return err
+	}
+
+	err = os.WriteFile(filename, jsonData, 0644)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *KVStore) Load(filename string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	jsonData, err := os.ReadFile(filename)
+	if err != nil {
+		return err
+	}
+
+	temp := make(map[string]string)
+	err = json.Unmarshal(jsonData, &temp)
+	if err != nil {
+		return err
+	}
+
+	s.data = temp
+
+	return nil
+}
+
 func main() {
 	store := NewStore()
-
-	store.Set("CEO", "Ahammed Nibras")
 
 	value, ok := store.Get("CEO")
 
@@ -71,7 +120,27 @@ func main() {
 	wg.Wait()
 
 	fmt.Println("Final KVStore contents:")
-	for k, v := range store.data {
+	all := store.GetAll()
+
+	for k, v := range all {
 		fmt.Println(k, "=", v)
+	}
+
+	// Save the Data to Disk
+	err := store.Save("data.json")
+	if err != nil {
+		fmt.Println("Error saving:", err)
+	} else {
+		fmt.Println("Data saved to data.json")
+	}
+
+	//Load Data to Memory
+	newStore := NewStore()
+
+	err = newStore.Load("data.json")
+	if err != nil {
+		fmt.Println("Load Error:", err)
+	} else {
+		fmt.Println("Loaded from disk:", newStore.GetAll())
 	}
 }
