@@ -31,6 +31,13 @@ func (s *KVStore) Get(key string) (string, bool) {
 	return value, ok
 }
 
+func (s *KVStore) Delete(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	delete(s.data, key)
+}
+
 func main() {
 	store := NewStore()
 
