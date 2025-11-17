@@ -8,13 +8,20 @@ import (
 )
 
 type KVStore struct {
-	mu   sync.RWMutex
-	data map[string]string
+	mu      sync.RWMutex
+	data    map[string]string
+	logFile *os.File
 }
 
 func NewStore() *KVStore {
+	logFile, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		panic(err)
+	}
+
 	return &KVStore{
-		data: make(map[string]string),
+		data:    make(map[string]string),
+		logFile: logFile,
 	}
 }
 
@@ -23,6 +30,13 @@ func (s *KVStore) Set(key, value string) {
 	defer s.mu.Unlock()
 
 	s.data[key] = value
+
+	entry := map[string]string{
+		"op":    "set",
+		"key":   key,
+		"value": value,
+	}
+	s.appendLog(entry)
 }
 
 func (s *KVStore) Get(key string) (string, bool) {
@@ -88,6 +102,15 @@ func (s *KVStore) Load(filename string) error {
 	s.data = temp
 
 	return nil
+}
+
+func (s *KVStore) appendLog(entry map[string]string) {
+	jsonBytes, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+
+	s.logFile.Write(append(jsonBytes, '\n'))
 }
 
 func main() {
