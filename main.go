@@ -201,20 +201,37 @@ func (s *KVStore) Recover() {
 
 func (s *KVStore) Compact() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+
+	snapshot := make(map[string]Entry, len(s.data))
+	for k, v := range s.data {
+		snapshot[k] = v
+	}
 
 	s.logFile.Close()
 
 	if err := os.Rename("wal.log", "wal.log.old"); err != nil {
+		s.mu.Unlock()
 		return err
 	}
 
 	newLog, err := os.OpenFile("wal.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
+		s.mu.Unlock()
 		return err
 	}
 
 	s.logFile = newLog
+
+	s.mu.Unlock()
+
+	go func(snapshotCopy map[string]Entry) {
+		jsonBytes, err := json.MarshalIndent(snapshotCopy, "", " ")
+		if err == nil {
+			_ = os.WriteFile("data.json", jsonBytes, 0644)
+		}
+
+		_ = os.Remove("wal.log.old")
+	}(snapshot)
 
 	return nil
 }
