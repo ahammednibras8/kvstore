@@ -199,6 +199,26 @@ func (s *KVStore) Recover() {
 	}
 }
 
+func (s *KVStore) Compact() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.logFile.Close()
+
+	if err := os.Rename("wal.log", "wal.log.old"); err != nil {
+		return err
+	}
+
+	newLog, err := os.OpenFile("wal.log", os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
+
+	s.logFile = newLog
+
+	return nil
+}
+
 func main() {
 	store := NewStore()
 
@@ -219,5 +239,12 @@ func main() {
 	fmt.Println("\nFinal Store State:")
 	for k, v := range store.GetAll() {
 		fmt.Println(k, "=>", v)
+	}
+
+	fmt.Println("\nRunning Compaction...")
+	if err := store.Compact(); err != nil {
+		fmt.Println("Compaction error:", err)
+	} else {
+		fmt.Println("Compaction complete! WAL rotated.")
 	}
 }
