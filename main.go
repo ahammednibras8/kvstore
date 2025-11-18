@@ -10,9 +10,10 @@ import (
 )
 
 type KVStore struct {
-	mu      sync.RWMutex
-	data    map[string]Entry
-	logFile *os.File
+	mu        sync.RWMutex
+	activeMap map[string]Entry
+	frozenMap map[string]Entry
+	logFile   *os.File
 }
 
 type Entry struct {
@@ -28,8 +29,9 @@ func NewStore() *KVStore {
 	}
 
 	kv := &KVStore{
-		data:    make(map[string]Entry),
-		logFile: logFile,
+		activeMap: make(map[string]Entry),
+		frozenMap: make(map[string]Entry),
+		logFile:   logFile,
 	}
 
 	kv.Recover()
@@ -46,7 +48,7 @@ func (s *KVStore) Set(key, value string) {
 		Timestamp: time.Now().UnixNano(),
 		Tombstone: false,
 	}
-	s.data[key] = entry
+	s.activeMap[key] = entry
 
 	walEntry := map[string]interface{}{
 		"op":        "set",
@@ -63,7 +65,7 @@ func (s *KVStore) Get(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	entry, ok := s.data[key]
+	entry, ok := s.activeMap[key]
 	if !ok || entry.Tombstone {
 		return "", false
 	}
@@ -81,7 +83,7 @@ func (s *KVStore) Delete(key string) {
 		Tombstone: true,
 	}
 
-	s.data[key] = entry
+	s.activeMap[key] = entry
 
 	walEntry := map[string]interface{}{
 		"op":        "delete",
@@ -97,9 +99,9 @@ func (s *KVStore) GetAll() map[string]Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	copyMap := make(map[string]Entry, len(s.data))
+	copyMap := make(map[string]Entry, len(s.activeMap))
 
-	for k, v := range s.data {
+	for k, v := range s.activeMap {
 		copyMap[k] = v
 	}
 
@@ -110,7 +112,7 @@ func (s *KVStore) Save(filename string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	jsonData, err := json.MarshalIndent(s.data, "", " ")
+	jsonData, err := json.MarshalIndent(s.activeMap, "", " ")
 	if err != nil {
 		return err
 	}
@@ -138,7 +140,7 @@ func (s *KVStore) Load(filename string) error {
 		return err
 	}
 
-	s.data = temp
+	s.activeMap = temp
 
 	return nil
 }
@@ -161,7 +163,7 @@ func (s *KVStore) Recover() {
 		if err == nil {
 			var snapshot map[string]Entry
 			if err := json.Unmarshal(snapshotBytes, &snapshot); err == nil {
-				s.data = snapshot
+				s.activeMap = snapshot
 			}
 		}
 	}
@@ -194,13 +196,13 @@ func (s *KVStore) Recover() {
 		case "set":
 			val, _ := entry["value"].(string)
 
-			s.data[key] = Entry{
+			s.activeMap[key] = Entry{
 				Value:     val,
 				Timestamp: ts,
 				Tombstone: false,
 			}
 		case "delete":
-			s.data[key] = Entry{
+			s.activeMap[key] = Entry{
 				Value:     "",
 				Timestamp: ts,
 				Tombstone: true,
@@ -212,10 +214,8 @@ func (s *KVStore) Recover() {
 func (s *KVStore) Compact() error {
 	s.mu.Lock()
 
-	snapshot := make(map[string]Entry, len(s.data))
-	for k, v := range s.data {
-		snapshot[k] = v
-	}
+	s.frozenMap = s.activeMap
+	s.activeMap = make(map[string]Entry)
 
 	s.logFile.Close()
 
@@ -241,7 +241,7 @@ func (s *KVStore) Compact() error {
 		}
 
 		_ = os.Remove("wal.log.old")
-	}(snapshot)
+	}(s.frozenMap)
 
 	return nil
 }
