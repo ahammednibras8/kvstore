@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,16 +14,26 @@ type KVStore struct {
 	logFile *os.File
 }
 
+type Entry struct {
+	Value     string `json:"value"`
+	Timestamp int64  `json:"timestamp"`
+	Tombstone bool   `json:"tombstone"`
+}
+
 func NewStore() *KVStore {
 	logFile, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
 		panic(err)
 	}
 
-	return &KVStore{
+	kv := &KVStore{
 		data:    make(map[string]string),
 		logFile: logFile,
 	}
+
+	kv.Recover()
+
+	return kv
 }
 
 func (s *KVStore) Set(key, value string) {
@@ -117,6 +128,38 @@ func (s *KVStore) appendLog(entry map[string]string) {
 	}
 
 	s.logFile.Write(append(jsonBytes, '\n'))
+}
+
+func (s *KVStore) Recover() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	file, err := os.Open("wal.log")
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		var entry map[string]string
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+
+		op := entry["op"]
+		key := entry["key"]
+
+		switch op {
+		case "set":
+			s.data[key] = entry["value"]
+		case "delete":
+			delete(s.data, key)
+		}
+	}
 }
 
 func main() {
