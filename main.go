@@ -6,11 +6,12 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 type KVStore struct {
 	mu      sync.RWMutex
-	data    map[string]string
+	data    map[string]Entry
 	logFile *os.File
 }
 
@@ -27,7 +28,7 @@ func NewStore() *KVStore {
 	}
 
 	kv := &KVStore{
-		data:    make(map[string]string),
+		data:    make(map[string]Entry),
 		logFile: logFile,
 	}
 
@@ -40,42 +41,63 @@ func (s *KVStore) Set(key, value string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.data[key] = value
-
-	entry := map[string]string{
-		"op":    "set",
-		"key":   key,
-		"value": value,
+	entry := Entry{
+		Value:     value,
+		Timestamp: time.Now().UnixNano(),
+		Tombstone: false,
 	}
-	s.appendLog(entry)
+	s.data[key] = entry
+
+	walEntry := map[string]interface{}{
+		"op":        "set",
+		"key":       key,
+		"value":     entry.Value,
+		"timestamp": entry.Timestamp,
+		"tombstone": entry.Tombstone,
+	}
+
+	s.appendLog(walEntry)
 }
 
 func (s *KVStore) Get(key string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	value, ok := s.data[key]
-	return value, ok
+	entry, ok := s.data[key]
+	if !ok || entry.Tombstone {
+		return "", false
+	}
+
+	return entry.Value, true
 }
 
 func (s *KVStore) Delete(key string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	delete(s.data, key)
-
-	entry := map[string]string{
-		"op":  "delete",
-		"key": key,
+	entry := Entry{
+		Value:     "",
+		Timestamp: time.Now().UnixNano(),
+		Tombstone: true,
 	}
-	s.appendLog(entry)
+
+	s.data[key] = entry
+
+	walEntry := map[string]interface{}{
+		"op":        "delete",
+		"key":       key,
+		"timestamp": entry.Timestamp,
+		"tombstone": entry.Tombstone,
+	}
+
+	s.appendLog(walEntry)
 }
 
-func (s *KVStore) GetAll() map[string]string {
+func (s *KVStore) GetAll() map[string]Entry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	copyMap := make(map[string]string, len(s.data))
+	copyMap := make(map[string]Entry, len(s.data))
 
 	for k, v := range s.data {
 		copyMap[k] = v
@@ -110,7 +132,7 @@ func (s *KVStore) Load(filename string) error {
 		return err
 	}
 
-	temp := make(map[string]string)
+	temp := make(map[string]Entry)
 	err = json.Unmarshal(jsonData, &temp)
 	if err != nil {
 		return err
@@ -121,7 +143,7 @@ func (s *KVStore) Load(filename string) error {
 	return nil
 }
 
-func (s *KVStore) appendLog(entry map[string]string) {
+func (s *KVStore) appendLog(entry map[string]interface{}) {
 	jsonBytes, err := json.Marshal(entry)
 	if err != nil {
 		return
@@ -145,19 +167,34 @@ func (s *KVStore) Recover() {
 	for scanner.Scan() {
 		line := scanner.Bytes()
 
-		var entry map[string]string
+		var entry map[string]interface{}
 		if err := json.Unmarshal(line, &entry); err != nil {
 			continue
 		}
 
-		op := entry["op"]
-		key := entry["key"]
+		op, _ := entry["op"].(string)
+		key, _ := entry["key"].(string)
+
+		var ts int64
+		if t, ok := entry["timestamp"].(float64); ok {
+			ts = int64(t)
+		}
 
 		switch op {
 		case "set":
-			s.data[key] = entry["value"]
+			val, _ := entry["value"].(string)
+
+			s.data[key] = Entry{
+				Value:     val,
+				Timestamp: ts,
+				Tombstone: false,
+			}
 		case "delete":
-			delete(s.data, key)
+			s.data[key] = Entry{
+				Value:     "",
+				Timestamp: ts,
+				Tombstone: true,
+			}
 		}
 	}
 }
@@ -165,54 +202,22 @@ func (s *KVStore) Recover() {
 func main() {
 	store := NewStore()
 
+	store.Set("CEO", "Ahammed Nibras")
+	store.Delete("CEO")
+
 	value, ok := store.Get("CEO")
-
-	if ok {
+	if !ok {
+		fmt.Println("CEO not found (correct, deleted)")
+	} else {
 		fmt.Println("CEO:", value)
-	} else {
-		fmt.Println("Key not found")
 	}
 
-	var wg sync.WaitGroup
+	store.Set("a", "apple")
+	store.Set("b", "banana")
+	store.Delete("a")
 
-	for i := 0; i < 10; i++ {
-		i := i
-
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
-			key := fmt.Sprintf("key%d", i)
-			val := fmt.Sprintf("value%d", i)
-			store.Set(key, val)
-		}()
-	}
-
-	wg.Wait()
-
-	fmt.Println("Final KVStore contents:")
-	all := store.GetAll()
-
-	for k, v := range all {
-		fmt.Println(k, "=", v)
-	}
-
-	// Save the Data to Disk
-	err := store.Save("data.json")
-	if err != nil {
-		fmt.Println("Error saving:", err)
-	} else {
-		fmt.Println("Data saved to data.json")
-	}
-
-	//Load Data to Memory
-	newStore := NewStore()
-
-	err = newStore.Load("data.json")
-	if err != nil {
-		fmt.Println("Load Error:", err)
-	} else {
-		fmt.Println("Loaded from disk:", newStore.GetAll())
+	fmt.Println("\nFinal Store State:")
+	for k, v := range store.GetAll() {
+		fmt.Println(k, "=>", v)
 	}
 }
