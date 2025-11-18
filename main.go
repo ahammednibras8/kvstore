@@ -156,6 +156,16 @@ func (s *KVStore) Recover() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if _, err := os.Stat("data.json"); err == nil {
+		snapshotBytes, err := os.ReadFile("data.json")
+		if err == nil {
+			var snapshot map[string]Entry
+			if err := json.Unmarshal(snapshotBytes, &snapshot); err == nil {
+				s.data = snapshot
+			}
+		}
+	}
+
 	file, err := os.Open("wal.log")
 	if err != nil {
 		return
