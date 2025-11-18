@@ -52,6 +52,12 @@ func (s *KVStore) Delete(key string) {
 	defer s.mu.Unlock()
 
 	delete(s.data, key)
+
+	entry := map[string]string{
+		"op":  "delete",
+		"key": key,
+	}
+	s.appendLog(entry)
 }
 
 func (s *KVStore) GetAll() map[string]string {
