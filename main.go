@@ -168,47 +168,11 @@ func (s *KVStore) Recover() {
 		}
 	}
 
-	file, err := os.Open("wal.log")
-	if err != nil {
-		return
+	if _, err := os.Stat("wal.log.old"); err == nil {
+		_ = s.replayLog("wal.log.old")
 	}
-	defer file.Close()
 
-	scanner := bufio.NewScanner(file)
-
-	for scanner.Scan() {
-		line := scanner.Bytes()
-
-		var entry map[string]interface{}
-		if err := json.Unmarshal(line, &entry); err != nil {
-			continue
-		}
-
-		op, _ := entry["op"].(string)
-		key, _ := entry["key"].(string)
-
-		var ts int64
-		if t, ok := entry["timestamp"].(float64); ok {
-			ts = int64(t)
-		}
-
-		switch op {
-		case "set":
-			val, _ := entry["value"].(string)
-
-			s.activeMap[key] = Entry{
-				Value:     val,
-				Timestamp: ts,
-				Tombstone: false,
-			}
-		case "delete":
-			s.activeMap[key] = Entry{
-				Value:     "",
-				Timestamp: ts,
-				Tombstone: true,
-			}
-		}
-	}
+	_ = s.replayLog("wal.log")
 }
 
 func (s *KVStore) Compact() error {
@@ -242,6 +206,50 @@ func (s *KVStore) Compact() error {
 
 		_ = os.Remove("wal.log.old")
 	}(s.frozenMap)
+
+	return nil
+}
+
+func (s *KVStore) replayLog(filename string) error {
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Bytes()
+
+		var entry map[string]interface{}
+		if err := json.Unmarshal(line, &entry); err != nil {
+			continue
+		}
+
+		op, _ := entry["op"].(string)
+		key, _ := entry["key"].(string)
+
+		var ts int64
+		if t, ok := entry["timestamp"].(float64); ok {
+			ts = int64(t)
+		}
+
+		switch op {
+		case "set":
+			val, _ := entry["value"].(string)
+			s.activeMap[key] = Entry{
+				Value:     val,
+				Timestamp: ts,
+				Tombstone: false,
+			}
+		case "delete":
+			s.activeMap[key] = Entry{
+				Value:     "",
+				Timestamp: ts,
+				Tombstone: true,
+			}
+		}
+	}
 
 	return nil
 }
