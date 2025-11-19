@@ -87,3 +87,21 @@ func (s *SkipList) Put(key string, value []byte) {
 		update[lvl].Next[lvl] = newNode
 	}
 }
+
+func (s *SkipList) Get(key string) ([]byte, bool) {
+	current := s.Head
+
+	for lvl := s.Level - 1; lvl >= 0; lvl-- {
+		for current.Next[lvl] != nil && current.Next[lvl].Key < key {
+			current = current.Next[lvl]
+		}
+	}
+
+	next := current.Next[0]
+
+	if next != nil && next.Key == key {
+		return next.Value, true
+	}
+
+	return nil, false
+}
