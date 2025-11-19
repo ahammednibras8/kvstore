@@ -2,6 +2,7 @@ package skiplist
 
 import (
 	"math/rand"
+	"sync/atomic"
 	"time"
 )
 
@@ -100,6 +101,7 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 	next := current.Next[0]
 
 	if next != nil && next.Key == key {
+		atomic.AddInt64(&next.AccessCount, 1)
 		return next.Value, true
 	}
 
