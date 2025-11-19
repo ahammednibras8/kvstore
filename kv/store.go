@@ -15,6 +15,7 @@ type Store struct {
 	avgAccess float64
 	alpha     float64
 	mu        sync.RWMutex
+	walGen    int64
 }
 
 func Open(path string) (*Store, error) {
@@ -93,7 +94,11 @@ func (s *Store) Flush() error {
 	// 1. Create new MemTable + WAL
 	newMem := skiplist.NewSkipList(0.5, 16)
 
-	newWal, err := wal.Open("wal.next")
+	s.walGen++
+
+	walFilename := fmt.Sprintf("wal-%d.log", s.walGen)
+
+	newWal, err := wal.Open(walFilename)
 	if err != nil {
 		return err
 	}
