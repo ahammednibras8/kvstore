@@ -2,6 +2,7 @@ package wal
 
 import (
 	"encoding/binary"
+	"io"
 	"os"
 	"sync"
 )
@@ -62,4 +63,51 @@ func (w *WAL) Write(entry Entry) error {
 	w.offset += int64(n)
 
 	return nil
+}
+
+func (w *WAL) Iterate(fn func(Entry) error) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	_, err := w.file.Seek(0, 0)
+	if err != nil {
+		return err
+	}
+
+	header := make([]byte, 16)
+
+	for {
+		// 1. Read the 16-byte Header
+		_, err := w.file.Read(header)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+
+		// 2. Decode keyLen and valLen
+		keyLen := binary.LittleEndian.Uint64(header[0:8])
+		valLen := binary.LittleEndian.Uint64(header[8:16])
+
+		// 3. Read the key
+		key := make([]byte, keyLen)
+		_, err = io.ReadFull(w.file, key)
+		if err != nil {
+			return err
+		}
+
+		// 4. Read the value
+		value := make([]byte, valLen)
+		_, err = io.ReadFull(w.file, value)
+		if err != nil {
+			return err
+		}
+
+		// 5. Callback with parsed entry
+		entry := Entry{Key: key, Value: value}
+		if err := fn(entry); err != nil {
+			return err
+		}
+	}
 }
