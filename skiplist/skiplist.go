@@ -47,6 +47,7 @@ func (s *SkipList) Put(key string, value []byte) {
 
 	current := s.Head
 
+	// 1. Find insert positions (predecessors)
 	for lvl := s.Level - 1; lvl >= 0; lvl-- {
 		for current.Next[lvl] != nil && current.Next[lvl].Key < key {
 			current = current.Next[lvl]
@@ -56,8 +57,33 @@ func (s *SkipList) Put(key string, value []byte) {
 
 	next := current.Next[0]
 
+	// 2. If the key already exists, replace the value
 	if next != nil && next.Key == key {
 		next.Value = value
 		return
+	}
+
+	// 3. Determine the height of the new node
+	newLevel := s.randomLevel()
+
+	// 4. If new node is taller, initialize update[] for high levels
+	if newLevel > s.Level {
+		for lvl := s.Level; lvl < newLevel; lvl++ {
+			update[lvl] = s.Head
+		}
+		s.Level = newLevel
+	}
+
+	// 5. Create the new node with 'newLevel' height
+	newNode := &Node{
+		Key:   key,
+		Value: value,
+		Next:  make([]*Node, newLevel),
+	}
+
+	// 6. Stitch in the new node at all levels
+	for lvl := 0; lvl < newLevel; lvl++ {
+		newNode.Next[lvl] = update[lvl].Next[lvl]
+		update[lvl].Next[lvl] = newNode
 	}
 }
