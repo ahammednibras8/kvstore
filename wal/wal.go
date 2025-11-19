@@ -111,3 +111,22 @@ func (w *WAL) Iterate(fn func(Entry) error) error {
 		}
 	}
 }
+
+func (w *WAL) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.file == nil {
+		return nil
+	}
+
+	_ = w.file.Sync()
+
+	err := w.file.Close()
+	w.file = nil
+	return err
+}
+
+func (w *WAL) Path() string {
+	return w.path
+}

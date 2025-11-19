@@ -2,9 +2,11 @@ package kv
 
 import (
 	"encoding/binary"
+	"fmt"
 	"kvstore/skiplist"
 	"kvstore/wal"
 	"os"
+	"sync"
 )
 
 type Store struct {
@@ -12,6 +14,7 @@ type Store struct {
 	log       *wal.WAL
 	avgAccess float64
 	alpha     float64
+	mu        sync.RWMutex
 }
 
 func Open(path string) (*Store, error) {
@@ -42,6 +45,9 @@ func Open(path string) (*Store, error) {
 }
 
 func (s *Store) Put(key string, value []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	err := s.log.Write(wal.Entry{
 		Key:   []byte(key),
 		Value: value,
@@ -55,10 +61,16 @@ func (s *Store) Put(key string, value []byte) error {
 }
 
 func (s *Store) Get(key string) ([]byte, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
 	return s.mem.Get(key)
 }
 
 func (s *Store) Flush() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	// A. Calculate instantaneous average access count
 	var sum float64
 	var count float64
@@ -86,6 +98,10 @@ func (s *Store) Flush() error {
 		return err
 	}
 
+	cleanupNewWal := func() {
+		_ = newWal.Close()
+	}
+
 	// 2. Open SSTable file for cold nodes
 	sstFile, err := os.OpenFile("store.sst", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
@@ -93,30 +109,58 @@ func (s *Store) Flush() error {
 	}
 	defer sstFile.Close()
 
-	// 3. Iterate through OLD memtable
-	s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
-		if float64(accessCount) > s.avgAccess {
-			newMem.Put(key, value)
-			_ = newWal.Write(wal.Entry{
-				Key:   []byte(key),
-				Value: value,
-			})
-		} else {
-			header := make([]byte, 16)
-			binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
-			binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
+	// 3. Iterate through OLD memtable and migrate
+	err = func() error {
+		var iterErr error
+		s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
+			if float64(accessCount) > s.avgAccess {
+				newMem.Put(key, value)
+				if werr := newWal.Write(wal.Entry{Key: []byte(key), Value: value}); werr != nil {
+					iterErr = werr
+					return false
+				}
+			} else {
+				header := make([]byte, 16)
+				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
+				binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
 
-			sstFile.Write(header)
-			sstFile.Write([]byte(key))
-			sstFile.Write(value)
-		}
+				if _, werr := sstFile.Write(header); werr != nil {
+					iterErr = werr
+					return false
+				}
+				if _, werr := sstFile.Write([]byte(key)); werr != nil {
+					iterErr = werr
+					return false
+				}
+				if _, werr := sstFile.Write(value); werr != nil {
+					iterErr = werr
+					return false
+				}
+			}
+			return true
+		})
+		return iterErr
+	}()
 
-		return true
-	})
+	if err != nil {
+		cleanupNewWal()
+		return fmt.Errorf("migration error: %w", err)
+	}
 
 	// 4. Swap old with new
+	oldWal := s.log
 	s.mem = newMem
 	s.log = newWal
+
+	if oldWal != nil {
+		if cerr := oldWal.Close(); cerr != nil {
+			_ = cerr
+		}
+
+		if oldPath := oldWal.Path(); oldPath != "" {
+			_ = os.Remove(oldPath)
+		}
+	}
 
 	return nil
 }
