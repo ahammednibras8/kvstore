@@ -8,11 +8,11 @@ import (
 )
 
 type Store struct {
-	mem *skiplist.SkipList
-	log *wal.WAL
+	mem       *skiplist.SkipList
+	log       *wal.WAL
+	avgAccess float64
+	alpha     float64
 }
-
-const HotThreshold = 10
 
 func Open(path string) (*Store, error) {
 	// 1. Open WAL
@@ -34,8 +34,10 @@ func Open(path string) (*Store, error) {
 	}
 
 	return &Store{
-		mem: mem,
-		log: w,
+		mem:       mem,
+		log:       w,
+		avgAccess: 0,
+		alpha:     0.4,
 	}, nil
 }
 
@@ -57,6 +59,25 @@ func (s *Store) Get(key string) ([]byte, bool) {
 }
 
 func (s *Store) Flush() error {
+	// A. Calculate instantaneous average access count
+	var sum float64
+	var count float64
+
+	s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
+		sum += float64(accessCount)
+		count++
+		return true
+	})
+
+	var currentMean float64
+	if count > 0 {
+		currentMean = sum / count
+	} else {
+		currentMean = 0
+	}
+
+	s.avgAccess = (s.alpha * currentMean) + ((1 - s.alpha) * s.avgAccess)
+
 	// 1. Create new MemTable + WAL
 	newMem := skiplist.NewSkipList(0.5, 16)
 
@@ -74,7 +95,7 @@ func (s *Store) Flush() error {
 
 	// 3. Iterate through OLD memtable
 	s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
-		if accessCount > HotThreshold {
+		if float64(accessCount) > s.avgAccess {
 			newMem.Put(key, value)
 			_ = newWal.Write(wal.Entry{
 				Key:   []byte(key),
