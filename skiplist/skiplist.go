@@ -41,3 +41,23 @@ func (s *SkipList) randomLevel() int {
 
 	return level
 }
+
+func (s *SkipList) Put(key string, value []byte) {
+	update := make([]*Node, s.MaxLevel)
+
+	current := s.Head
+
+	for lvl := s.Level - 1; lvl >= 0; lvl-- {
+		for current.Next[lvl] != nil && current.Next[lvl].Key < key {
+			current = current.Next[lvl]
+		}
+		update[lvl] = current
+	}
+
+	next := current.Next[0]
+
+	if next != nil && next.Key == key {
+		next.Value = value
+		return
+	}
+}
