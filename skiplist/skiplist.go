@@ -107,3 +107,15 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 
 	return nil, false
 }
+
+func (s *SkipList) Iterator(fn func(key string, value []byte, accessCount int64) bool) {
+	current := s.Head.Next[0]
+
+	for current != nil {
+		if !fn(current.Key, current.Value, current.AccessCount) {
+			return
+		}
+
+		current = current.Next[0]
+	}
+}
