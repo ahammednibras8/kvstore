@@ -113,14 +113,16 @@ func (s *Store) Flush() error {
 
 	cleanupNewWal := func() {
 		_ = newWal.Close()
+		_ = os.Remove("store.sst.temp")
 	}
 
-	// 2. Open SSTable file for cold nodes
-	sstFile, err := os.OpenFile("store.sst", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// 2. Create a TEMP SSTable file (atomic swap pattern)
+	tmpName := "store.sst.temp"
+	sstTmp, err := os.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return err
+		cleanupNewWal()
+		return fmt.Errorf("open tmp sst: %w", err)
 	}
-	defer sstFile.Close()
 
 	// 3. Iterate through OLD memtable and migrate
 	err = func() error {
@@ -137,15 +139,15 @@ func (s *Store) Flush() error {
 				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
 				binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
 
-				if _, werr := sstFile.Write(header); werr != nil {
+				if _, werr := sstTmp.Write(header); werr != nil {
 					iterErr = werr
 					return false
 				}
-				if _, werr := sstFile.Write([]byte(key)); werr != nil {
+				if _, werr := sstTmp.Write([]byte(key)); werr != nil {
 					iterErr = werr
 					return false
 				}
-				if _, werr := sstFile.Write(value); werr != nil {
+				if _, werr := sstTmp.Write(value); werr != nil {
 					iterErr = werr
 					return false
 				}
@@ -157,17 +159,39 @@ func (s *Store) Flush() error {
 
 	if err != nil {
 		cleanupNewWal()
+		_ = sstTmp.Close()
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("migration error: %w", err)
 	}
 
-	// 4. Swap old with new
+	// 4. Ensure temp file is flushed to disk and closed
+	if err := sstTmp.Sync(); err != nil {
+		cleanupNewWal()
+		_ = sstTmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("sync tmp sst: %w", err)
+	}
+	if err := sstTmp.Close(); err != nil {
+		cleanupNewWal()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("close tmp sst: %w", err)
+	}
+
+	// 5. Atomically replace store.sst with the temp file
+	if err := os.Rename(tmpName, "store.sst"); err != nil {
+		cleanupNewWal()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("rename tmp sst: %w", err)
+	}
+
+	// 6. Swap old WAL/mem with new ones (we hold the store lock)
 	oldWal := s.log
 	s.mem = newMem
 	s.log = newWal
 
 	if oldWal != nil {
 		if cerr := oldWal.Close(); cerr != nil {
-			_ = cerr
+			log.Printf("warning: failed to close old wal: %v", cerr)
 		}
 
 		if oldPath := oldWal.Path(); oldPath != "" {
@@ -200,7 +224,12 @@ func (s *Store) readFromSSTable(key string) ([]byte, bool) {
 		if err == io.EOF {
 			return nil, false
 		}
+		if err == io.ErrUnexpectedEOF {
+			log.Printf("SSTable corruption: partial header encountered - stopping parse")
+			return nil, false
+		}
 		if err != nil {
+			log.Printf("SSTable read error (header): %v", err)
 			return nil, false
 		}
 
