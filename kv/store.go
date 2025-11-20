@@ -18,6 +18,9 @@ type Store struct {
 	alpha     float64
 	mu        sync.RWMutex
 	walGen    int64
+	sstGen    int64
+	sstFiles  []string
+	sstDir    string
 }
 
 func Open(path string) (*Store, error) {
@@ -73,7 +76,13 @@ func (s *Store) Get(key string) ([]byte, bool) {
 	}
 
 	// 2. Check SSTable
-	return s.readFromSSTable(key)
+	for _, filename := range s.sstFiles {
+		if val, found := s.readFromSSTable(filename, key); found {
+			return val, true
+		}
+	}
+
+	return nil, false
 }
 
 func (s *Store) Flush() error {
@@ -103,7 +112,6 @@ func (s *Store) Flush() error {
 	newMem := skiplist.NewSkipList(0.5, 16)
 
 	s.walGen++
-
 	walFilename := fmt.Sprintf("wal-%d.log", s.walGen)
 
 	newWal, err := wal.Open(walFilename)
@@ -113,12 +121,14 @@ func (s *Store) Flush() error {
 
 	cleanupNewWal := func() {
 		_ = newWal.Close()
-		_ = os.Remove("store.sst.temp")
 	}
 
-	// 2. Create a TEMP SSTable file (atomic swap pattern)
-	tmpName := "store.sst.temp"
-	sstTmp, err := os.OpenFile(tmpName, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	// 2. Create SST filename (level 0 style)
+	s.sstGen++
+	finalSST := fmt.Sprintf("sst-%d.sst", s.sstGen)
+	tmpSST := finalSST + ".temp"
+
+	sstTmp, err := os.OpenFile(tmpSST, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
 		cleanupNewWal()
 		return fmt.Errorf("open tmp sst: %w", err)
@@ -160,7 +170,7 @@ func (s *Store) Flush() error {
 	if err != nil {
 		cleanupNewWal()
 		_ = sstTmp.Close()
-		_ = os.Remove(tmpName)
+		_ = os.Remove(tmpSST)
 		return fmt.Errorf("migration error: %w", err)
 	}
 
@@ -168,19 +178,19 @@ func (s *Store) Flush() error {
 	if err := sstTmp.Sync(); err != nil {
 		cleanupNewWal()
 		_ = sstTmp.Close()
-		_ = os.Remove(tmpName)
+		_ = os.Remove(tmpSST)
 		return fmt.Errorf("sync tmp sst: %w", err)
 	}
 	if err := sstTmp.Close(); err != nil {
 		cleanupNewWal()
-		_ = os.Remove(tmpName)
+		_ = os.Remove(tmpSST)
 		return fmt.Errorf("close tmp sst: %w", err)
 	}
 
 	// 5. Atomically replace store.sst with the temp file
-	if err := os.Rename(tmpName, "store.sst"); err != nil {
+	if err := os.Rename(tmpSST, "store.sst"); err != nil {
 		cleanupNewWal()
-		_ = os.Remove(tmpName)
+		_ = os.Remove(tmpSST)
 		return fmt.Errorf("rename tmp sst: %w", err)
 	}
 
@@ -208,9 +218,9 @@ func (s *Store) AvgAccess() float64 {
 	return s.avgAccess
 }
 
-func (s *Store) readFromSSTable(key string) ([]byte, bool) {
+func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 	// 1. Open the SSTable (read-only)
-	f, err := os.Open("store.sst")
+	f, err := os.Open(filename)
 	if err != nil {
 		return nil, false
 	}
@@ -220,7 +230,7 @@ func (s *Store) readFromSSTable(key string) ([]byte, bool) {
 
 	for {
 		// 2. Read header: keyLen + valLen
-		_, err := f.Read(header)
+		_, err := io.ReadFull(f, header)
 		if err == io.EOF {
 			return nil, false
 		}
