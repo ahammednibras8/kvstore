@@ -3,6 +3,7 @@ package kv
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"kvstore/skiplist"
 	"kvstore/wal"
 	"os"
@@ -65,7 +66,13 @@ func (s *Store) Get(key string) ([]byte, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.mem.Get(key)
+	// 1. Check the MemTable
+	if val, found := s.mem.Get(key); found {
+		return val, true
+	}
+
+	// 2. Check SSTable
+	return s.readFromSSTable(key)
 }
 
 func (s *Store) Flush() error {
@@ -174,4 +181,52 @@ func (s *Store) AvgAccess() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.avgAccess
+}
+
+func (s *Store) readFromSSTable(key string) ([]byte, bool) {
+	// 1. Open the SSTable (read-only)
+	f, err := os.Open("store.sst")
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	header := make([]byte, 16)
+
+	for {
+		// 2. Read header: keyLen + valLen
+		_, err := f.Read(header)
+		if err == io.EOF {
+			return nil, false
+		}
+		if err != nil {
+			return nil, false
+		}
+
+		keyLen := binary.LittleEndian.Uint64(header[0:8])
+		valLen := binary.LittleEndian.Uint64(header[8:16])
+
+		// 3. Read the key
+		keyBytes := make([]byte, keyLen)
+		_, err = io.ReadFull(f, keyBytes)
+		if err != nil {
+			return nil, false
+		}
+
+		// 4. Compare to target key
+		if string(keyBytes) == key {
+			value := make([]byte, valLen)
+			_, err = io.ReadFull(f, value)
+			if err != nil {
+				return nil, false
+			}
+			return value, true
+		}
+
+		// 5. No Match -> Skip the value bytes
+		_, err = f.Seek(int64(valLen), io.SeekCurrent)
+		if err != nil {
+			return nil, false
+		}
+	}
 }

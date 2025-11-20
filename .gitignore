@@ -1,2 +1,2 @@
 store.sst
-wal-1.log
+wal-*.log
