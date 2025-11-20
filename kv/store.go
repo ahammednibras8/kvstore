@@ -169,3 +169,9 @@ func (s *Store) Flush() error {
 
 	return nil
 }
+
+func (s *Store) AvgAccess() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.avgAccess
+}
