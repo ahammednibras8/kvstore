@@ -59,20 +59,25 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("glob sst files: %w", err)
 	}
 
-	// 5. Determine highest sstGen from filenames
-	for _, f := range files {
-		var gen int64
-		if _, err := fmt.Sscanf(f, "sst-%d.sst", &gen); err == nil {
-			if gen > s.sstGen {
-				s.sstGen = gen
-			}
+	parseGen := func(name string) int64 {
+		var g int64
+		if _, err := fmt.Sscanf(name, "sst-%d.sst", &g); err == nil {
+			return g
 		}
+		return -1
 	}
 
-	// 6. Sort newest to oldest
-	for i := len(files)/2 - 1; i >= 0; i-- {
-		opp := len(files) - 1 - i
-		files[i], files[opp] = files[opp], files[i]
+	// 5. Sort by generation newest to oldest
+	sort.Slice(files, func(i, j int) bool {
+		return parseGen(files[i]) > parseGen(files[j])
+	})
+
+	// 6. Determine Heighest generation
+	for _, f := range files {
+		gen := parseGen(f)
+		if gen > s.sstGen {
+			s.sstGen = gen
+		}
 	}
 
 	s.sstFiles = files
@@ -107,37 +112,7 @@ func (s *Store) Get(key string) ([]byte, bool) {
 		return val, true
 	}
 
-	// 2. Build a local copy of sstFiles and sort newest to oldest by generation.
-	files := make([]string, len(s.sstFiles))
-	copy(files, s.sstFiles)
-
-	parseGen := func(name string) int64 {
-		var g int64
-		if _, err := fmt.Sscanf(name, "sst-%d.sst", &g); err == nil {
-			return g
-		}
-		return -1
-	}
-
-	sort.Slice(files, func(i, j int) bool {
-		gi := parseGen(files[i])
-		gj := parseGen(files[j])
-
-		if gi >= 0 && gj >= 0 {
-			return gi > gj
-		}
-
-		if gi >= 0 {
-			return true
-		}
-		if gj >= 0 {
-			return false
-		}
-
-		return files[i] > files[j]
-	})
-
-	// 3. Check SSTable
+	// 2. Check SSTables already sorted
 	for _, filename := range s.sstFiles {
 		if val, found := s.readFromSSTable(filename, key); found {
 			return val, true
