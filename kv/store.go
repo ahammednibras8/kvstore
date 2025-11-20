@@ -6,6 +6,7 @@ import (
 	"io"
 	"kvstore/skiplist"
 	"kvstore/wal"
+	"log"
 	"os"
 	"sync"
 )
@@ -209,7 +210,12 @@ func (s *Store) readFromSSTable(key string) ([]byte, bool) {
 		// 3. Read the key
 		keyBytes := make([]byte, keyLen)
 		_, err = io.ReadFull(f, keyBytes)
+		if err == io.ErrUnexpectedEOF {
+			log.Printf("SSTable corruption: incomplete ket/value entry - stopping parse")
+			return nil, false
+		}
 		if err != nil {
+			log.Printf("SSTable read error: %v", err)
 			return nil, false
 		}
 
