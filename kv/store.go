@@ -8,6 +8,7 @@ import (
 	"kvstore/wal"
 	"log"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -42,12 +43,35 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{
+	s := &Store{
 		mem:       mem,
 		log:       w,
 		avgAccess: 0,
 		alpha:     0.4,
-	}, nil
+		sstFiles:  []string{},
+		sstGen:    0,
+	}
+
+	// 4. Discover existing SST files
+	files, err := filepath.Glob("sst-*.sst")
+	if err != nil {
+		return nil, fmt.Errorf("glob sst files: %w", err)
+	}
+
+	s.sstFiles = files
+
+	// 5. Determine highest sstGen from filenames
+	for _, f := range files {
+		var gen int64
+		_, err := fmt.Sscanf(f, "sst-%d.sst", &gen)
+		if err == nil && gen > int64(s.sstGen) {
+			s.sstGen = gen
+		}
+	}
+
+	log.Printf("Loaded %d SST files. Highest generation = %d", len(s.sstFiles), s.sstGen)
+
+	return s, nil
 }
 
 func (s *Store) Put(key string, value []byte) error {
@@ -188,11 +212,12 @@ func (s *Store) Flush() error {
 	}
 
 	// 5. Atomically replace store.sst with the temp file
-	if err := os.Rename(tmpSST, "store.sst"); err != nil {
+	if err := os.Rename(tmpSST, finalSST); err != nil {
 		cleanupNewWal()
 		_ = os.Remove(tmpSST)
 		return fmt.Errorf("rename tmp sst: %w", err)
 	}
+	s.sstFiles = append([]string{finalSST}, s.sstFiles...)
 
 	// 6. Swap old WAL/mem with new ones (we hold the store lock)
 	oldWal := s.log
