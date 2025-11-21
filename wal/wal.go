@@ -15,6 +15,7 @@ type WAL struct {
 }
 
 type Entry struct {
+	Type  byte
 	Key   []byte
 	Value []byte
 }
@@ -49,8 +50,9 @@ func (w *WAL) Write(entry Entry) error {
 	binary.LittleEndian.PutUint64(header[0:8], uint64(len(entry.Key)))
 	binary.LittleEndian.PutUint64(header[8:16], uint64(len(entry.Value)))
 
-	// 2. Bundle header + key + value
-	record := append(header, entry.Key...)
+	// 2. Bundle header + type + key + value
+	record := append(header, entry.Type)
+	record = append(record, entry.Key...)
 	record = append(record, entry.Value...)
 
 	// 3. Write the file automatically
