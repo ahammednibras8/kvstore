@@ -1,30 +1,46 @@
 # Organic KV: A Self-Organizing Storage Engine
 
-A high-performance, persistent Key-Value store built in Go. Unlike standard databases that treat all data equally, Organic KV implements a biological "metabolism" that automatically tiers data based on usage patterns.
+Organic KV is a high-performance, persistent key-value store built in Go.
+Instead of treating all data equally, it implements a biological metabolism that continuously reorganizes the system based on real workload patterns.
+
+Data doesn’t just live here — it adapts.
 
 ## 🧠 The Core Innovation: Organic Tiering
 
-Most databases rely on complex, distinct caching layers (Redis + Postgres). Organic KV unifies this by implementing an internal **Survival of the Fittest** eviction policy:
+Traditional databases bolt caching layers on top of storage (Redis → Postgres).
+Organic KV collapses this into a single self-regulating engine:
 
-1.  **Traffic Sensing:** Every node in the MemTable tracks its own `AccessCount` using atomic counters (lock-free reads).
-2.  **Metabolic Flush:** During disk flushes, the system calculates the global "Temperature" using an **Exponentially Weighted Moving Average (EWMA)**.
-3.  **Natural Selection:**
-    - **Hot Data (> Temperature):** Survives in memory (migrated to the next generation MemTable).
-    - **Cold Data (< Temperature):** Evicted to compressed disk storage (SSTable).
+1. **Traffic Sensing** — Every key tracks its own AccessCount via atomic counters.own `AccessCount` using atomic counters (lock-free reads).
+2. **Metabolic Flush** — At flush time, the system computes a global “Temperature” using an Exponentially Weighted Moving Average (EWMA).
+3. **Natural Selection**
+
+   - **Hot Data (> Temperature)** stays in memory.
+   - **Cold Data (< Temperature)** is pushed to immutable SSTables on disk.
+
+   The result: a storage engine that performs continuous internal optimization without external caches, heuristics, or administrators.
 
 ## 🏗 Architecture
 
-### 1. The Storage Engine (LSM-Tree)
+### 1. Storage Engine (LSM-Tree Core)
 
-- **MemTable:** Implemented as a **Probabilistic Skip List** ($O(\log n)$). Chosen over Red-Black trees to reduce concurrent contention.
-- **WAL (Write-Ahead Log):** Append-only durability. Uses a **Length-Prefixed** binary format to ensure crash recovery.
-- **SSTable:** Immutable disk files for cold data storage.
+- **MemTable:** A probabilistic Skip List with O(log n) performance. Chosen over Red-Black Trees to reduce structural rotations and global lock contention under concurrent writes.
+
+- **Tiered Read Path:** Get() first checks the MemTable, then scans SSTables from newest → oldest, guaranteeing:
+  - The newest value always wins.
+  - No “time-travel reads.”
+  - Deterministic cold-data lookup.
+- **WAL (Write-Ahead Log):** Append-only, length-prefixed binary log to guarantee recoverability with minimal overhead.
 
 ### 2. Concurrency & Safety
 
-- **Thread Safety:** Uses `sync.RWMutex` for high-throughput concurrent reads.
-- **Generational Log Rotation:** Implements monotonic generation IDs (`wal-1.log`, `wal-2.log`) to ensure safe file rotation without locking writers.
-- **Crash Recovery:** Full log replay capability on startup to restore memory state.
+- **Crash-Safe Atomic Flush:** SSTables are written to <name>.temp, then:
+  1. Fully fsync’d to disk
+  2. Closed
+  3. Atomically renamed → final SST
+     This ensures the engine never lands in a half-written state.
+- **Generational File System:** Monotonic filenames (sst-7.sst) guarantee ordering, simplify recovery, and prevent accidental overwrite.
+- **Thread Model:** sync.RWMutex enables high-throughput concurrent reads while maintaining strict write safety.
+- **Full WAL Replay on Startup:** Recovery reconstructs the complete MemTable state of the last successful generation.
 
 ## 🚀 Quick Start
 
@@ -35,19 +51,16 @@ Most databases rely on complex, distinct caching layers (Redis + Postgres). Orga
 ### Running the Server
 
 ```bash
-go mod init kvstore
 go run cmd/server/main.go
 ```
 
-### API Usage
-
-#### Set a Key
+#### Write a Key
 
 ```
 curl -X POST http://localhost:8080/set -d '{"key":"systems","value":"engineer"}'
 ```
 
-#### Get a Key
+#### Read a Key
 
 ```
 curl "http://localhost:8080/get?key=systems"
@@ -59,8 +72,8 @@ curl "http://localhost:8080/get?key=systems"
 curl -X POST http://localhost:8080/flush
 ```
 
-## Future Improvements
+## Strategic Roadmap
 
-- **Bloom Filters:** To eliminate disk seeks for non-existent keys in SSTables.
-- **Sparse Index:** To optimize SSTable lookups.
-- **Compaction:** Merging multiple SSTables to reclaim space.
+- **Bloom Filters:** Eliminate unnecessary disk seeks on key misses, reducing read latency for cold data.
+- **Sparse Index:** Accelerate SSTable lookups by enabling block-level binary search instead of full-file scans.
+- **Autonomous Compaction:** Background merging and deduplication of SSTables to maintain consistent read latency and reclaim storage as data evolves.
