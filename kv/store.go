@@ -3,9 +3,13 @@ package kv
 import (
 	"encoding/binary"
 	"fmt"
+	"io"
 	"kvstore/skiplist"
 	"kvstore/wal"
+	"log"
 	"os"
+	"path/filepath"
+	"sort"
 	"sync"
 )
 
@@ -16,6 +20,9 @@ type Store struct {
 	alpha     float64
 	mu        sync.RWMutex
 	walGen    int64
+	sstGen    int64
+	sstFiles  []string
+	sstDir    string
 }
 
 func Open(path string) (*Store, error) {
@@ -37,12 +44,47 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 
-	return &Store{
+	s := &Store{
 		mem:       mem,
 		log:       w,
 		avgAccess: 0,
 		alpha:     0.4,
-	}, nil
+		sstFiles:  []string{},
+		sstGen:    0,
+	}
+
+	// 4. Discover existing SST files
+	files, err := filepath.Glob("sst-*.sst")
+	if err != nil {
+		return nil, fmt.Errorf("glob sst files: %w", err)
+	}
+
+	parseGen := func(name string) int64 {
+		var g int64
+		if _, err := fmt.Sscanf(name, "sst-%d.sst", &g); err == nil {
+			return g
+		}
+		return -1
+	}
+
+	// 5. Sort by generation newest to oldest
+	sort.Slice(files, func(i, j int) bool {
+		return parseGen(files[i]) > parseGen(files[j])
+	})
+
+	// 6. Determine Heighest generation
+	for _, f := range files {
+		gen := parseGen(f)
+		if gen > s.sstGen {
+			s.sstGen = gen
+		}
+	}
+
+	s.sstFiles = files
+
+	log.Printf("Loaded %d SST files (newest→oldest). Highest generation = %d", len(s.sstFiles), s.sstGen)
+
+	return s, nil
 }
 
 func (s *Store) Put(key string, value []byte) error {
@@ -65,7 +107,19 @@ func (s *Store) Get(key string) ([]byte, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	return s.mem.Get(key)
+	// 1. Check the MemTable
+	if val, found := s.mem.Get(key); found {
+		return val, true
+	}
+
+	// 2. Check SSTables already sorted
+	for _, filename := range s.sstFiles {
+		if val, found := s.readFromSSTable(filename, key); found {
+			return val, true
+		}
+	}
+
+	return nil, false
 }
 
 func (s *Store) Flush() error {
@@ -95,7 +149,6 @@ func (s *Store) Flush() error {
 	newMem := skiplist.NewSkipList(0.5, 16)
 
 	s.walGen++
-
 	walFilename := fmt.Sprintf("wal-%d.log", s.walGen)
 
 	newWal, err := wal.Open(walFilename)
@@ -107,12 +160,16 @@ func (s *Store) Flush() error {
 		_ = newWal.Close()
 	}
 
-	// 2. Open SSTable file for cold nodes
-	sstFile, err := os.OpenFile("store.sst", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	// 2. Create SST filename (level 0 style)
+	s.sstGen++
+	finalSST := fmt.Sprintf("sst-%d.sst", s.sstGen)
+	tmpSST := finalSST + ".temp"
+
+	sstTmp, err := os.OpenFile(tmpSST, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return err
+		cleanupNewWal()
+		return fmt.Errorf("open tmp sst: %w", err)
 	}
-	defer sstFile.Close()
 
 	// 3. Iterate through OLD memtable and migrate
 	err = func() error {
@@ -129,15 +186,15 @@ func (s *Store) Flush() error {
 				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
 				binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
 
-				if _, werr := sstFile.Write(header); werr != nil {
+				if _, werr := sstTmp.Write(header); werr != nil {
 					iterErr = werr
 					return false
 				}
-				if _, werr := sstFile.Write([]byte(key)); werr != nil {
+				if _, werr := sstTmp.Write([]byte(key)); werr != nil {
 					iterErr = werr
 					return false
 				}
-				if _, werr := sstFile.Write(value); werr != nil {
+				if _, werr := sstTmp.Write(value); werr != nil {
 					iterErr = werr
 					return false
 				}
@@ -149,17 +206,40 @@ func (s *Store) Flush() error {
 
 	if err != nil {
 		cleanupNewWal()
+		_ = sstTmp.Close()
+		_ = os.Remove(tmpSST)
 		return fmt.Errorf("migration error: %w", err)
 	}
 
-	// 4. Swap old with new
+	// 4. Ensure temp file is flushed to disk and closed
+	if err := sstTmp.Sync(); err != nil {
+		cleanupNewWal()
+		_ = sstTmp.Close()
+		_ = os.Remove(tmpSST)
+		return fmt.Errorf("sync tmp sst: %w", err)
+	}
+	if err := sstTmp.Close(); err != nil {
+		cleanupNewWal()
+		_ = os.Remove(tmpSST)
+		return fmt.Errorf("close tmp sst: %w", err)
+	}
+
+	// 5. Atomically replace store.sst with the temp file
+	if err := os.Rename(tmpSST, finalSST); err != nil {
+		cleanupNewWal()
+		_ = os.Remove(tmpSST)
+		return fmt.Errorf("rename tmp sst: %w", err)
+	}
+	s.sstFiles = append([]string{finalSST}, s.sstFiles...)
+
+	// 6. Swap old WAL/mem with new ones (we hold the store lock)
 	oldWal := s.log
 	s.mem = newMem
 	s.log = newWal
 
 	if oldWal != nil {
 		if cerr := oldWal.Close(); cerr != nil {
-			_ = cerr
+			log.Printf("warning: failed to close old wal: %v", cerr)
 		}
 
 		if oldPath := oldWal.Path(); oldPath != "" {
@@ -174,4 +254,62 @@ func (s *Store) AvgAccess() float64 {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.avgAccess
+}
+
+func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
+	// 1. Open the SSTable (read-only)
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, false
+	}
+	defer f.Close()
+
+	header := make([]byte, 16)
+
+	for {
+		// 2. Read header: keyLen + valLen
+		_, err := io.ReadFull(f, header)
+		if err == io.EOF {
+			return nil, false
+		}
+		if err == io.ErrUnexpectedEOF {
+			log.Printf("SSTable corruption: partial header encountered - stopping parse")
+			return nil, false
+		}
+		if err != nil {
+			log.Printf("SSTable read error (header): %v", err)
+			return nil, false
+		}
+
+		keyLen := binary.LittleEndian.Uint64(header[0:8])
+		valLen := binary.LittleEndian.Uint64(header[8:16])
+
+		// 3. Read the key
+		keyBytes := make([]byte, keyLen)
+		_, err = io.ReadFull(f, keyBytes)
+		if err == io.ErrUnexpectedEOF {
+			log.Printf("SSTable corruption: incomplete ket/value entry - stopping parse")
+			return nil, false
+		}
+		if err != nil {
+			log.Printf("SSTable read error: %v", err)
+			return nil, false
+		}
+
+		// 4. Compare to target key
+		if string(keyBytes) == key {
+			value := make([]byte, valLen)
+			_, err = io.ReadFull(f, value)
+			if err != nil {
+				return nil, false
+			}
+			return value, true
+		}
+
+		// 5. No Match -> Skip the value bytes
+		_, err = f.Seek(int64(valLen), io.SeekCurrent)
+		if err != nil {
+			return nil, false
+		}
+	}
 }
