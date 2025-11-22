@@ -177,7 +177,11 @@ func (s *Store) Flush() error {
 		s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
 			if float64(accessCount) > s.avgAccess {
 				newMem.Put(key, value)
-				if werr := newWal.Write(wal.Entry{Key: []byte(key), Value: value}); werr != nil {
+				if werr := newWal.Write(wal.Entry{
+					Type:  0,
+					Key:   []byte(key),
+					Value: value,
+				}); werr != nil {
 					iterErr = werr
 					return false
 				}
@@ -186,14 +190,25 @@ func (s *Store) Flush() error {
 				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
 				binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
 
+				// a. write header
 				if _, werr := sstTmp.Write(header); werr != nil {
 					iterErr = werr
 					return false
 				}
+
+				// b. write Type byte (0 = PUT)
+				if _, werr := sstTmp.Write([]byte{0}); werr != nil {
+					iterErr = werr
+					return false
+				}
+
+				// c. write Key
 				if _, werr := sstTmp.Write([]byte(key)); werr != nil {
 					iterErr = werr
 					return false
 				}
+
+				// d. write Value
 				if _, werr := sstTmp.Write(value); werr != nil {
 					iterErr = werr
 					return false
