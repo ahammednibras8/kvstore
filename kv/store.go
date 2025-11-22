@@ -180,7 +180,12 @@ func (s *Store) Flush() error {
 		var iterErr error
 		s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 			if float64(accessCount) > s.avgAccess {
-				newMem.Put(key, value)
+				if typ == 1 {
+					newMem.Delete(key)
+				} else {
+					newMem.Put(key, value)
+				}
+
 				if werr := newWal.Write(wal.Entry{
 					Type:  typ,
 					Key:   []byte(key),
