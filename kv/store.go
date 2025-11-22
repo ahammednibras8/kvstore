@@ -350,3 +350,21 @@ func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 		}
 	}
 }
+
+func (s *Store) Delete(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	err := s.log.Write(wal.Entry{
+		Type:  1,
+		Key:   []byte(key),
+		Value: nil,
+	})
+	if err != nil {
+		return err
+	}
+
+	s.mem.Delete(key)
+
+	return nil
+}
