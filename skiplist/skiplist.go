@@ -60,6 +60,7 @@ func (s *SkipList) Put(key string, value []byte) {
 
 	// 2. If the key already exists, replace the value
 	if next != nil && next.Key == key {
+		next.Type = 0
 		next.Value = value
 		return
 	}
@@ -78,6 +79,7 @@ func (s *SkipList) Put(key string, value []byte) {
 	// 5. Create the new node with 'newLevel' height
 	newNode := &Node{
 		Key:   key,
+		Type:  0,
 		Value: value,
 		Next:  make([]*Node, newLevel),
 	}
@@ -101,6 +103,10 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 	next := current.Next[0]
 
 	if next != nil && next.Key == key {
+		if next.Type == 1 {
+			return nil, false
+		}
+
 		atomic.AddInt64(&next.AccessCount, 1)
 		return next.Value, true
 	}
@@ -108,14 +114,59 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 	return nil, false
 }
 
-func (s *SkipList) Iterator(fn func(key string, value []byte, accessCount int64) bool) {
+func (s *SkipList) Iterator(fn func(key string, value []byte, typ byte, accessCount int64) bool) {
 	current := s.Head.Next[0]
 
 	for current != nil {
-		if !fn(current.Key, current.Value, current.AccessCount) {
+		if !fn(current.Key, current.Value, current.Type, current.AccessCount) {
 			return
 		}
 
 		current = current.Next[0]
+	}
+}
+
+func (s *SkipList) Delete(key string) {
+	update := make([]*Node, s.MaxLevel)
+	current := s.Head
+
+	// 1. Find predecessors
+	for lvl := s.Level - 1; lvl >= 0; lvl-- {
+		for current.Next[lvl] != nil && current.Next[lvl].Key < key {
+			current = current.Next[lvl]
+		}
+		update[lvl] = current
+	}
+
+	next := current.Next[0]
+
+	// 2. If node already exists, convert it into a tombstone
+	if next != nil && next.Key == key {
+		next.Type = 1
+		next.Value = nil
+		return
+	}
+
+	// 3. Create a new tombstone node
+	newLevel := s.randomLevel()
+
+	if newLevel > s.Level {
+		for lvl := s.Level; lvl < newLevel; lvl++ {
+			update[lvl] = s.Head
+		}
+		s.Level = newLevel
+	}
+
+	newNode := &Node{
+		Key:   key,
+		Type:  1,
+		Value: nil,
+		Next:  make([]*Node, newLevel),
+	}
+
+	// 4. Insert node into all levels
+	for lvl := 0; lvl < newLevel; lvl++ {
+		newNode.Next[lvl] = update[lvl].Next[lvl]
+		update[lvl].Next[lvl] = newNode
 	}
 }

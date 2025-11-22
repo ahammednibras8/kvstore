@@ -37,6 +37,10 @@ func Open(path string) (*Store, error) {
 
 	// 3. Replay WAL history into the memtable
 	err = w.Iterate(func(e wal.Entry) error {
+		if e.Type == 1 {
+			mem.Delete(string(e.Key))
+			return nil
+		}
 		mem.Put(string(e.Key), e.Value)
 		return nil
 	})
@@ -92,6 +96,7 @@ func (s *Store) Put(key string, value []byte) error {
 	defer s.mu.Unlock()
 
 	err := s.log.Write(wal.Entry{
+		Type:  0,
 		Key:   []byte(key),
 		Value: value,
 	})
@@ -130,7 +135,7 @@ func (s *Store) Flush() error {
 	var sum float64
 	var count float64
 
-	s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
+	s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 		sum += float64(accessCount)
 		count++
 		return true
@@ -174,29 +179,52 @@ func (s *Store) Flush() error {
 	// 3. Iterate through OLD memtable and migrate
 	err = func() error {
 		var iterErr error
-		s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
+		s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 			if float64(accessCount) > s.avgAccess {
-				newMem.Put(key, value)
-				if werr := newWal.Write(wal.Entry{Key: []byte(key), Value: value}); werr != nil {
+				if typ == 1 {
+					newMem.Delete(key)
+				} else {
+					newMem.Put(key, value)
+				}
+
+				if werr := newWal.Write(wal.Entry{
+					Type:  typ,
+					Key:   []byte(key),
+					Value: value,
+				}); werr != nil {
 					iterErr = werr
 					return false
 				}
+				return true
 			} else {
 				header := make([]byte, 16)
 				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
 				binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
 
+				// a. write header
 				if _, werr := sstTmp.Write(header); werr != nil {
 					iterErr = werr
 					return false
 				}
+
+				// b. write Type byte (0 = PUT, 1 = DELETE)
+				if _, werr := sstTmp.Write([]byte{typ}); werr != nil {
+					iterErr = werr
+					return false
+				}
+
+				// c. write Key
 				if _, werr := sstTmp.Write([]byte(key)); werr != nil {
 					iterErr = werr
 					return false
 				}
-				if _, werr := sstTmp.Write(value); werr != nil {
-					iterErr = werr
-					return false
+
+				// d. write Value
+				if value != nil {
+					if _, werr := sstTmp.Write(value); werr != nil {
+						iterErr = werr
+						return false
+					}
 				}
 			}
 			return true
@@ -284,32 +312,60 @@ func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 		keyLen := binary.LittleEndian.Uint64(header[0:8])
 		valLen := binary.LittleEndian.Uint64(header[8:16])
 
-		// 3. Read the key
-		keyBytes := make([]byte, keyLen)
-		_, err = io.ReadFull(f, keyBytes)
-		if err == io.ErrUnexpectedEOF {
-			log.Printf("SSTable corruption: incomplete ket/value entry - stopping parse")
-			return nil, false
-		}
+		// 3. Read Type byte
+		var typ [1]byte
+		_, err = io.ReadFull(f, typ[:])
 		if err != nil {
-			log.Printf("SSTable read error: %v", err)
+			log.Printf("SSTable read error (type): %v", err)
 			return nil, false
 		}
 
-		// 4. Compare to target key
+		// 4. Read the key
+		keyBytes := make([]byte, keyLen)
+		_, err = io.ReadFull(f, keyBytes)
+		if err != nil {
+			log.Printf("SSTable read error (key): %v", err)
+			return nil, false
+		}
+
+		// 5. Compare to target key
 		if string(keyBytes) == key {
+			if typ[0] == 1 {
+				return nil, false
+			}
+
 			value := make([]byte, valLen)
 			_, err = io.ReadFull(f, value)
 			if err != nil {
+				log.Printf("SSTable read error (value): %v", err)
 				return nil, false
 			}
 			return value, true
 		}
 
-		// 5. No Match -> Skip the value bytes
+		// 6. No Match -> Skip the value bytes
 		_, err = f.Seek(int64(valLen), io.SeekCurrent)
 		if err != nil {
+			log.Printf("SSTable seek error: %v", err)
 			return nil, false
 		}
 	}
+}
+
+func (s *Store) Delete(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	err := s.log.Write(wal.Entry{
+		Type:  1,
+		Key:   []byte(key),
+		Value: nil,
+	})
+	if err != nil {
+		return err
+	}
+
+	s.mem.Delete(key)
+
+	return nil
 }

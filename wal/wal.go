@@ -15,6 +15,7 @@ type WAL struct {
 }
 
 type Entry struct {
+	Type  byte
 	Key   []byte
 	Value []byte
 }
@@ -49,8 +50,9 @@ func (w *WAL) Write(entry Entry) error {
 	binary.LittleEndian.PutUint64(header[0:8], uint64(len(entry.Key)))
 	binary.LittleEndian.PutUint64(header[8:16], uint64(len(entry.Value)))
 
-	// 2. Bundle header + key + value
-	record := append(header, entry.Key...)
+	// 2. Bundle header + type + key + value
+	record := append(header, entry.Type)
+	record = append(record, entry.Key...)
 	record = append(record, entry.Value...)
 
 	// 3. Write the file automatically
@@ -78,34 +80,49 @@ func (w *WAL) Iterate(fn func(Entry) error) error {
 
 	for {
 		// 1. Read the 16-byte Header
-		_, err := w.file.Read(header)
+		_, err := io.ReadFull(w.file, header)
 		if err == io.EOF {
+			return nil
+		}
+		if err == io.ErrUnexpectedEOF {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
 
-		// 2. Decode keyLen and valLen
+		// 2. Decode lengths
 		keyLen := binary.LittleEndian.Uint64(header[0:8])
 		valLen := binary.LittleEndian.Uint64(header[8:16])
 
-		// 3. Read the key
+		// 3. Read Type byte
+		var typByte [1]byte
+		_, err = io.ReadFull(w.file, typByte[:])
+		if err != nil {
+			return err
+		}
+
+		// 4. Read key
 		key := make([]byte, keyLen)
 		_, err = io.ReadFull(w.file, key)
 		if err != nil {
 			return err
 		}
 
-		// 4. Read the value
+		// 5. Read the value bytes
 		value := make([]byte, valLen)
 		_, err = io.ReadFull(w.file, value)
 		if err != nil {
 			return err
 		}
 
-		// 5. Callback with parsed entry
-		entry := Entry{Key: key, Value: value}
+		// 6. Invoke callback
+		entry := Entry{
+			Type:  typByte[0],
+			Key:   key,
+			Value: value,
+		}
+
 		if err := fn(entry); err != nil {
 			return err
 		}

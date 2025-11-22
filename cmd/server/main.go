@@ -79,5 +79,25 @@ func main() {
 		fmt.Fprintf(w, "Flush Complete.\n")
 	})
 
+	http.HandleFunc("/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "DELETE required", http.StatusMethodNotAllowed)
+			return
+		}
+
+		key := r.URL.Query().Get("key")
+		if key == "" {
+			http.Error(w, "key is required", http.StatusBadRequest)
+			return
+		}
+
+		if err := store.Delete(key); err != nil {
+			http.Error(w, "failed to delete key: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		fmt.Fprintf(w, "OK: deleted key = %s\n", key)
+	})
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
