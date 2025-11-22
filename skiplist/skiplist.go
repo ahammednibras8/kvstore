@@ -60,6 +60,7 @@ func (s *SkipList) Put(key string, value []byte) {
 
 	// 2. If the key already exists, replace the value
 	if next != nil && next.Key == key {
+		next.Type = 0
 		next.Value = value
 		return
 	}
