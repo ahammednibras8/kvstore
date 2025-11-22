@@ -96,6 +96,7 @@ func (s *Store) Put(key string, value []byte) error {
 	defer s.mu.Unlock()
 
 	err := s.log.Write(wal.Entry{
+		Type:  0,
 		Key:   []byte(key),
 		Value: value,
 	})
