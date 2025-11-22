@@ -130,7 +130,7 @@ func (s *Store) Flush() error {
 	var sum float64
 	var count float64
 
-	s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
+	s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 		sum += float64(accessCount)
 		count++
 		return true
@@ -174,17 +174,18 @@ func (s *Store) Flush() error {
 	// 3. Iterate through OLD memtable and migrate
 	err = func() error {
 		var iterErr error
-		s.mem.Iterator(func(key string, value []byte, accessCount int64) bool {
+		s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 			if float64(accessCount) > s.avgAccess {
 				newMem.Put(key, value)
 				if werr := newWal.Write(wal.Entry{
-					Type:  0,
+					Type:  typ,
 					Key:   []byte(key),
 					Value: value,
 				}); werr != nil {
 					iterErr = werr
 					return false
 				}
+				return true
 			} else {
 				header := make([]byte, 16)
 				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
@@ -196,8 +197,8 @@ func (s *Store) Flush() error {
 					return false
 				}
 
-				// b. write Type byte (0 = PUT)
-				if _, werr := sstTmp.Write([]byte{0}); werr != nil {
+				// b. write Type byte (0 = PUT, 1 = DELETE)
+				if _, werr := sstTmp.Write([]byte{typ}); werr != nil {
 					iterErr = werr
 					return false
 				}
@@ -209,9 +210,11 @@ func (s *Store) Flush() error {
 				}
 
 				// d. write Value
-				if _, werr := sstTmp.Write(value); werr != nil {
-					iterErr = werr
-					return false
+				if value != nil {
+					if _, werr := sstTmp.Write(value); werr != nil {
+						iterErr = werr
+						return false
+					}
 				}
 			}
 			return true
