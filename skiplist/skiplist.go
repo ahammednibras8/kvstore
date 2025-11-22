@@ -78,6 +78,7 @@ func (s *SkipList) Put(key string, value []byte) {
 	// 5. Create the new node with 'newLevel' height
 	newNode := &Node{
 		Key:   key,
+		Type:  0,
 		Value: value,
 		Next:  make([]*Node, newLevel),
 	}
@@ -104,7 +105,7 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 		if next.Type == 1 {
 			return nil, false
 		}
-		
+
 		atomic.AddInt64(&next.AccessCount, 1)
 		return next.Value, true
 	}
