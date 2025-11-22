@@ -37,6 +37,10 @@ func Open(path string) (*Store, error) {
 
 	// 3. Replay WAL history into the memtable
 	err = w.Iterate(func(e wal.Entry) error {
+		if e.Type == 1 {
+			mem.Delete(string(e.Key))
+			return nil
+		}
 		mem.Put(string(e.Key), e.Value)
 		return nil
 	})
