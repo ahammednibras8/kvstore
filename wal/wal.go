@@ -2,8 +2,10 @@ package wal
 
 import (
 	"encoding/binary"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -21,9 +23,36 @@ type Entry struct {
 }
 
 func Open(path string) (*WAL, error) {
+	// 1. Discover existing wal-*.log files
+	walFiles, _ := filepath.Glob("wal-*.log")
+
+	parseGen := func(name string) int64 {
+		var g int64
+		if _, err := fmt.Sscanf(name, "wal-%d.log", &g); err == nil {
+			return g
+		}
+		return -1
+	}
+
+	// 2. Determine which WAL to open
+	var walPath string
+
+	if len(walFiles) == 0 {
+		walPath = path
+	} else {
+		newest := walFiles[0]
+		for _, f := range walFiles {
+			if parseGen(f) > parseGen(newest) {
+				newest = f
+			}
+		}
+		walPath = newest
+	}
+
+	// 3. Open WAL file
 	flags := os.O_CREATE | os.O_RDWR | os.O_APPEND
 
-	f, err := os.OpenFile(path, flags, 0644)
+	f, err := os.OpenFile(walPath, flags, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -36,7 +65,7 @@ func Open(path string) (*WAL, error) {
 
 	return &WAL{
 		file:   f,
-		path:   path,
+		path:   walPath,
 		offset: info.Size(),
 	}, nil
 }
