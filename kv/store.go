@@ -299,31 +299,41 @@ func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 		keyLen := binary.LittleEndian.Uint64(header[0:8])
 		valLen := binary.LittleEndian.Uint64(header[8:16])
 
-		// 3. Read the key
-		keyBytes := make([]byte, keyLen)
-		_, err = io.ReadFull(f, keyBytes)
-		if err == io.ErrUnexpectedEOF {
-			log.Printf("SSTable corruption: incomplete ket/value entry - stopping parse")
-			return nil, false
-		}
+		// 3. Read Type byte
+		var typ [1]byte
+		_, err = io.ReadFull(f, typ[:])
 		if err != nil {
-			log.Printf("SSTable read error: %v", err)
+			log.Printf("SSTable read error (type): %v", err)
 			return nil, false
 		}
 
-		// 4. Compare to target key
+		// 4. Read the key
+		keyBytes := make([]byte, keyLen)
+		_, err = io.ReadFull(f, keyBytes)
+		if err != nil {
+			log.Printf("SSTable read error (key): %v", err)
+			return nil, false
+		}
+
+		// 5. Compare to target key
 		if string(keyBytes) == key {
+			if typ[0] == 1 {
+				return nil, false
+			}
+
 			value := make([]byte, valLen)
 			_, err = io.ReadFull(f, value)
 			if err != nil {
+				log.Printf("SSTable read error (value): %v", err)
 				return nil, false
 			}
 			return value, true
 		}
 
-		// 5. No Match -> Skip the value bytes
+		// 6. No Match -> Skip the value bytes
 		_, err = f.Seek(int64(valLen), io.SeekCurrent)
 		if err != nil {
+			log.Printf("SSTable seek error: %v", err)
 			return nil, false
 		}
 	}
