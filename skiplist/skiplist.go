@@ -101,6 +101,10 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 	next := current.Next[0]
 
 	if next != nil && next.Key == key {
+		if next.Type == 1 {
+			return nil, false
+		}
+		
 		atomic.AddInt64(&next.AccessCount, 1)
 		return next.Value, true
 	}
