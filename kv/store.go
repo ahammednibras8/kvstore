@@ -25,6 +25,7 @@ type Store struct {
 	sstFiles      []string
 	sstDir        string
 	sparseIndexes map[string][]SparseIndexEntry
+	bloomFilter   map[string]*BloomFilter
 }
 
 type HeapNode struct {
@@ -89,6 +90,7 @@ func Open(path string) (*Store, error) {
 		sstFiles:      []string{},
 		sstGen:        0,
 		sparseIndexes: make(map[string][]SparseIndexEntry),
+		bloomFilter:   make(map[string]*BloomFilter),
 	}
 
 	// 4. Discover existing SST files
@@ -120,7 +122,89 @@ func Open(path string) (*Store, error) {
 
 	s.sstFiles = files
 
+	// Track highest generation
+	for _, f := range files {
+		g := parseGen(f)
+		if g > s.sstGen {
+			s.sstGen = g
+		}
+	}
+
 	log.Printf("Loaded %d SST files (newest→oldest). Highest generation = %d", len(s.sstFiles), s.sstGen)
+
+	// REBUILD bloom filter + sparse index for every SST file
+	for _, filename := range files {
+		f, err := os.Open(filename)
+		if err != nil {
+			return nil, fmt.Errorf("open sst %s: %w", filename, err)
+		}
+
+		// Conservative estimate: size / 100 bytes per record
+		info, _ := f.Stat()
+		estimatedN := int(info.Size() / 100)
+		if estimatedN < 1 {
+			estimatedN = 1
+		}
+		bf := NewBloomFilter(estimatedN, 0.01)
+
+		var sparse []SparseIndexEntry
+		const blockSize int64 = 1024
+		var lastIndexPos int64 = 0
+
+		offset := int64(0)
+
+		for {
+			header := make([]byte, 16)
+			_, err := io.ReadFull(f, header)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				f.Close()
+				return nil, fmt.Errorf("sst read header: %w", err)
+			}
+
+			keyLen := binary.LittleEndian.Uint64(header[0:8])
+			valLen := binary.LittleEndian.Uint64(header[8:16])
+
+			var typ [1]byte
+			if _, err := io.ReadFull(f, typ[:]); err != nil {
+				f.Close()
+				return nil, err
+			}
+
+			keyBytes := make([]byte, keyLen)
+			if _, err := io.ReadFull(f, keyBytes); err != nil {
+				f.Close()
+				return nil, err
+			}
+			key := string(keyBytes)
+
+			// Skip Value
+			if _, err := f.Seek(int64(valLen), io.SeekCurrent); err != nil {
+				f.Close()
+				return nil, err
+			}
+
+			// Add to Bloom Filter (tombstones INCLUDED)
+			bf.Add(key)
+
+			// Sparse index insertion
+			if offset-lastIndexPos >= blockSize {
+				sparse = append(sparse, SparseIndexEntry{
+					Key:    key,
+					Offset: offset,
+				})
+				lastIndexPos = offset
+			}
+
+			offset, _ = f.Seek(0, io.SeekCurrent)
+		}
+
+		s.bloomFilter[filename] = bf
+		s.sparseIndexes[filename] = sparse
+		f.Close()
+	}
 
 	return s, nil
 }
@@ -185,6 +269,13 @@ func (s *Store) Flush() error {
 
 	s.avgAccess = (s.alpha * currentMean) + ((1 - s.alpha) * s.avgAccess)
 
+	// Create Bloom Filter
+	estimatedN := int(count)
+	if estimatedN < 1 {
+		estimatedN = 1
+	}
+	bf := NewBloomFilter(estimatedN, 0.01)
+
 	// 1. Create new MemTable + WAL
 	newMem := skiplist.NewSkipList(0.5, 16)
 
@@ -216,10 +307,17 @@ func (s *Store) Flush() error {
 	var lastIndexPos int64 = 0
 	const blockSize int64 = 1024
 
+	var lastKeyWritten string
+
 	// 3. Iterate through OLD memtable and migrate
 	err = func() error {
 		var iterErr error
 		s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
+			if key == lastKeyWritten {
+				return true
+			}
+			lastKeyWritten = key
+
 			if float64(accessCount) > s.avgAccess {
 				// Momentum Decay
 				decayFactor := 0.5
@@ -252,6 +350,9 @@ func (s *Store) Flush() error {
 				})
 				lastIndexPos = offset
 			}
+
+			// Add Key to Bloom Fileter
+			bf.Add(key)
 
 			// Write SST Enrtry
 			header := make([]byte, 16)
@@ -315,6 +416,8 @@ func (s *Store) Flush() error {
 	}
 
 	s.sparseIndexes[finalSST] = sparse
+	// Save the bloom Fileter for SST file
+	s.bloomFilter[finalSST] = bf
 	s.sstFiles = append([]string{finalSST}, s.sstFiles...)
 
 	// 6. Swap old WAL/mem with new ones (we hold the store lock)
@@ -348,6 +451,14 @@ func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 		return nil, false
 	}
 	defer f.Close()
+
+	// Bloom Filter Check
+	bf := s.bloomFilter[filename]
+	if bf != nil {
+		if !bf.Contains(targetKey) {
+			return nil, false
+		}
+	}
 
 	// 2. LookUp sparse index for this file
 	sparse := s.sparseIndexes[filename]
@@ -446,7 +557,7 @@ func (s *Store) Delete(key string) error {
 		return err
 	}
 
-	s.mem.Delete(key)
+	s.mem.PutSurvivor(key, nil, 1, 0)
 
 	return nil
 }
@@ -516,7 +627,22 @@ func (s *Store) Compact() error {
 		return nil
 	}
 
-	// 1. Open SST files and build initial heap
+	// 1. Estimate Bloom Filter size
+	var totalSize int64
+	for _, f := range inputFiles {
+		info, err := os.Stat(f)
+		if err == nil {
+			totalSize += info.Size()
+		}
+	}
+
+	// Assume ~100 bytes per entry
+	estimatedN := int(totalSize / 100)
+	if estimatedN < 1 {
+		estimatedN = 1
+	}
+
+	// 2. Open SST files and build initial heap
 	readers := make([]*os.File, len(inputFiles))
 	h := &EntryHeap{}
 	heap.Init(h)
@@ -535,7 +661,7 @@ func (s *Store) Compact() error {
 		}
 	}
 
-	// 2. Create output SST (temp)
+	// 3. Create output SST (temp)
 	s.sstGen++
 	outName := fmt.Sprintf("sst-%d.sst", s.sstGen)
 	tmpName := outName + ".tmp"
@@ -546,6 +672,9 @@ func (s *Store) Compact() error {
 	}
 	defer out.Close()
 
+	// Create Bloom Filter for new file
+	bf := NewBloomFilter(estimatedN, 0.01)
+
 	var lastkey string
 
 	// Sparse Index Setup
@@ -553,11 +682,14 @@ func (s *Store) Compact() error {
 	var lastIndexPos int64 = 0
 	const blockSize int64 = 1024
 
-	// 3. K-way merge loop
+	// 4. K-way merge loop
 	for h.Len() > 0 {
 		minNode := heap.Pop(h).(*HeapNode)
 
 		if minNode.Key != lastkey {
+			// Add key to Bloom Filter — EVEN tombstones
+			bf.Add(minNode.Key)
+
 			if minNode.Type == 0 {
 				offset, _ := out.Seek(0, io.SeekCurrent)
 				if offset-lastIndexPos >= blockSize {
@@ -582,13 +714,13 @@ func (s *Store) Compact() error {
 		}
 	}
 
-	// 4. Sync + close output
+	// 5. Sync + close output
 	if err := out.Sync(); err != nil {
 		return err
 	}
 	out.Close()
 
-	// 5. Replace SST list
+	// 6. Replace SST list
 	if err := os.Rename(tmpName, outName); err != nil {
 		return err
 	}
@@ -599,11 +731,17 @@ func (s *Store) Compact() error {
 	// Save Sparse Index
 	s.sparseIndexes[outName] = sparse
 
-	// 6. Delete all old SST files
+	s.bloomFilter[outName] = bf
+
+	// 7. Delete all old SST files
 	for _, f := range oldFile {
 		if err := os.Remove(f); err != nil {
 			log.Printf("warning: failed to delete old SST %s: %v", f, err)
 		}
+
+		// Remove stale metadata to prevent memory leak
+		delete(s.sparseIndexes, f)
+		delete(s.bloomFilter, f)
 	}
 
 	return nil
