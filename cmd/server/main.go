@@ -99,5 +99,19 @@ func main() {
 		fmt.Fprintf(w, "OK: deleted key = %s\n", key)
 	})
 
+	http.HandleFunc("/compact", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST required", http.StatusMethodNotAllowed)
+			return
+		}
+
+		if err := store.Compact(); err != nil {
+			http.Error(w, "compaction error: " +err.Error(), http.StatusInternalServerError)
+			return
+		}
+
+		fmt.Fprintf(w, "Compaction Complete.\n")
+	})
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

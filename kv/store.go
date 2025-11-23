@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,15 +15,47 @@ import (
 )
 
 type Store struct {
-	mem       *skiplist.SkipList
-	log       *wal.WAL
-	avgAccess float64
-	alpha     float64
-	mu        sync.RWMutex
-	walGen    int64
-	sstGen    int64
-	sstFiles  []string
-	sstDir    string
+	mem           *skiplist.SkipList
+	log           *wal.WAL
+	avgAccess     float64
+	alpha         float64
+	mu            sync.RWMutex
+	walGen        int64
+	sstGen        int64
+	sstFiles      []string
+	sstDir        string
+	sparseIndexes map[string][]SparseIndexEntry
+}
+
+type HeapNode struct {
+	Key       string
+	Value     []byte
+	Type      byte
+	FileIndex int
+	Gen       int64
+}
+
+type EntryHeap []*HeapNode
+
+func (h EntryHeap) Len() int { return len(h) }
+func (h EntryHeap) Less(i, j int) bool {
+	if h[i].Key != h[j].Key {
+		return h[i].Key < h[j].Key
+	}
+	return h[i].FileIndex < h[j].FileIndex
+}
+func (h EntryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *EntryHeap) Push(x interface{}) {
+	*h = append(*h, x.(*HeapNode))
+}
+
+func (h *EntryHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[0 : n-1]
+	return item
 }
 
 func Open(path string) (*Store, error) {
@@ -49,12 +82,13 @@ func Open(path string) (*Store, error) {
 	}
 
 	s := &Store{
-		mem:       mem,
-		log:       w,
-		avgAccess: 0,
-		alpha:     0.4,
-		sstFiles:  []string{},
-		sstGen:    0,
+		mem:           mem,
+		log:           w,
+		avgAccess:     0,
+		alpha:         0.4,
+		sstFiles:      []string{},
+		sstGen:        0,
+		sparseIndexes: make(map[string][]SparseIndexEntry),
 	}
 
 	// 4. Discover existing SST files
@@ -176,15 +210,25 @@ func (s *Store) Flush() error {
 		return fmt.Errorf("open tmp sst: %w", err)
 	}
 
+	// sparse index setup
+	var sparse []SparseIndexEntry
+	var lastIndexPos int64 = 0
+	const blockSize int64 = 1024
+
 	// 3. Iterate through OLD memtable and migrate
 	err = func() error {
 		var iterErr error
 		s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 			if float64(accessCount) > s.avgAccess {
+				// Momentum Decay
+				decayFactor := 0.5
+				decayHits := max(int64(float64(accessCount)*decayFactor), 1)
+
+				// Insert into new MemTable with momentum
 				if typ == 1 {
-					newMem.Delete(key)
+					newMem.PutSurvivor(key, nil, 1, decayHits)
 				} else {
-					newMem.Put(key, value)
+					newMem.PutSurvivor(key, value, 0, decayHits)
 				}
 
 				if werr := newWal.Write(wal.Entry{
@@ -196,35 +240,46 @@ func (s *Store) Flush() error {
 					return false
 				}
 				return true
-			} else {
-				header := make([]byte, 16)
-				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
-				binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
+			}
 
-				// a. write header
-				if _, werr := sstTmp.Write(header); werr != nil {
+			// Before wrinting entry get offset
+			offset, _ := sstTmp.Seek(0, io.SeekCurrent)
+			if offset-lastIndexPos >= blockSize {
+				sparse = append(sparse, SparseIndexEntry{
+					Key:    key,
+					Offset: offset,
+				})
+				lastIndexPos = offset
+			}
+
+			// Write SST Enrtry
+			header := make([]byte, 16)
+			binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
+			binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
+
+			// a. write header
+			if _, werr := sstTmp.Write(header); werr != nil {
+				iterErr = werr
+				return false
+			}
+
+			// b. write Type byte (0 = PUT, 1 = DELETE)
+			if _, werr := sstTmp.Write([]byte{typ}); werr != nil {
+				iterErr = werr
+				return false
+			}
+
+			// c. write Key
+			if _, werr := sstTmp.Write([]byte(key)); werr != nil {
+				iterErr = werr
+				return false
+			}
+
+			// d. write Value
+			if value != nil {
+				if _, werr := sstTmp.Write(value); werr != nil {
 					iterErr = werr
 					return false
-				}
-
-				// b. write Type byte (0 = PUT, 1 = DELETE)
-				if _, werr := sstTmp.Write([]byte{typ}); werr != nil {
-					iterErr = werr
-					return false
-				}
-
-				// c. write Key
-				if _, werr := sstTmp.Write([]byte(key)); werr != nil {
-					iterErr = werr
-					return false
-				}
-
-				// d. write Value
-				if value != nil {
-					if _, werr := sstTmp.Write(value); werr != nil {
-						iterErr = werr
-						return false
-					}
 				}
 			}
 			return true
@@ -255,9 +310,10 @@ func (s *Store) Flush() error {
 	// 5. Atomically replace store.sst with the temp file
 	if err := os.Rename(tmpSST, finalSST); err != nil {
 		cleanupNewWal()
-		_ = os.Remove(tmpSST)
 		return fmt.Errorf("rename tmp sst: %w", err)
 	}
+
+	s.sparseIndexes[finalSST] = sparse
 	s.sstFiles = append([]string{finalSST}, s.sstFiles...)
 
 	// 6. Swap old WAL/mem with new ones (we hold the store lock)
@@ -366,6 +422,164 @@ func (s *Store) Delete(key string) error {
 	}
 
 	s.mem.Delete(key)
+
+	return nil
+}
+
+func readNextEntry(f *os.File) (*HeapNode, error) {
+	header := make([]byte, 16)
+
+	_, err := io.ReadFull(f, header)
+	if err != nil {
+		return nil, err
+	}
+
+	keyLen := binary.LittleEndian.Uint64(header[0:8])
+	valLen := binary.LittleEndian.Uint64(header[8:16])
+
+	var typ [1]byte
+	if _, err := io.ReadFull(f, typ[:]); err != nil {
+		return nil, err
+	}
+
+	key := make([]byte, keyLen)
+	if _, err := io.ReadFull(f, key); err != nil {
+		return nil, err
+	}
+
+	value := make([]byte, valLen)
+	if valLen > 0 {
+		if _, err := io.ReadFull(f, value); err != nil {
+			return nil, err
+		}
+	}
+
+	return &HeapNode{
+		Key:   string(key),
+		Value: value,
+		Type:  typ[0],
+	}, nil
+}
+
+func writeSSTEntry(out *os.File, n *HeapNode) error {
+	header := make([]byte, 16)
+	binary.LittleEndian.PutUint64(header[0:8], uint64(len(n.Key)))
+	binary.LittleEndian.PutUint64(header[8:16], uint64(len(n.Value)))
+
+	if _, err := out.Write(header); err != nil {
+		return err
+	}
+	if _, err := out.Write([]byte{n.Type}); err != nil {
+		return err
+	}
+	if _, err := out.Write([]byte(n.Key)); err != nil {
+		return err
+	}
+	if _, err := out.Write(n.Value); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Store) Compact() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	inputFiles := s.sstFiles
+	if len(inputFiles) < 2 {
+		return nil
+	}
+
+	// 1. Open SST files and build initial heap
+	readers := make([]*os.File, len(inputFiles))
+	h := &EntryHeap{}
+	heap.Init(h)
+
+	for i, filename := range inputFiles {
+		f, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+		readers[i] = f
+
+		if node, err := readNextEntry(f); err == nil {
+			node.FileIndex = i
+			node.Gen = int64(i)
+			heap.Push(h, node)
+		}
+	}
+
+	// 2. Create output SST (temp)
+	s.sstGen++
+	outName := fmt.Sprintf("sst-%d.sst", s.sstGen)
+	tmpName := outName + ".tmp"
+
+	out, err := os.Create(tmpName)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	var lastkey string
+
+	// Sparse Index Setup
+	var sparse []SparseIndexEntry
+	var lastIndexPos int64 = 0
+	const blockSize int64 = 1024
+
+	// 3. K-way merge loop
+	for h.Len() > 0 {
+		minNode := heap.Pop(h).(*HeapNode)
+
+		if minNode.Key != lastkey {
+			if minNode.Type == 0 {
+				offset, _ := out.Seek(0, io.SeekCurrent)
+				if offset-lastIndexPos >= blockSize {
+					sparse = append(sparse, SparseIndexEntry{
+						Key:    minNode.Key,
+						Offset: offset,
+					})
+					lastIndexPos = offset
+				}
+
+				if err := writeSSTEntry(out, minNode); err != nil {
+					return err
+				}
+			}
+			lastkey = minNode.Key
+		}
+
+		if nextNode, err := readNextEntry(readers[minNode.FileIndex]); err == nil {
+			nextNode.FileIndex = minNode.FileIndex
+			nextNode.Gen = minNode.Gen
+			heap.Push(h, nextNode)
+		}
+	}
+
+	// 4. Sync + close output
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	out.Close()
+
+	// 5. Replace SST list
+	if err := os.Rename(tmpName, outName); err != nil {
+		return err
+	}
+
+	oldFile := inputFiles
+	s.sstFiles = []string{outName}
+
+	// Save Sparse Index
+	s.sparseIndexes[outName] = sparse
+
+	// 6. Delete all old SST files
+	for _, f := range oldFile {
+		if err := os.Remove(f); err != nil {
+			log.Printf("warning: failed to delete old SST %s: %v", f, err)
+		}
+	}
 
 	return nil
 }
