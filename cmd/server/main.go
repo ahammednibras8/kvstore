@@ -54,13 +54,13 @@ func main() {
 			return
 		}
 
-		value, found := store.Get(key)
+		value, hits, found := store.Get(key)
 		if !found {
 			http.Error(w, "not found", http.StatusNotFound)
 			return
 		}
 
-		log.Printf("GET key=%s | new temerature(avgAccess)=%.2f", key, store.AvgAccess())
+		log.Printf("GET key=%s | Hits=%d | SystemAvg=%.2f", key, hits, store.AvgAccess())
 
 		w.Write(value)
 	})
@@ -106,7 +106,7 @@ func main() {
 		}
 
 		if err := store.Compact(); err != nil {
-			http.Error(w, "compaction error: " +err.Error(), http.StatusInternalServerError)
+			http.Error(w, "compaction error: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 

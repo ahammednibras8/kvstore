@@ -91,7 +91,7 @@ func (s *SkipList) Put(key string, value []byte) {
 	}
 }
 
-func (s *SkipList) Get(key string) ([]byte, bool) {
+func (s *SkipList) Get(key string) ([]byte, int64, bool) {
 	current := s.Head
 
 	for lvl := s.Level - 1; lvl >= 0; lvl-- {
@@ -104,14 +104,14 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 
 	if next != nil && next.Key == key {
 		if next.Type == 1 {
-			return nil, false
+			return nil, 0, false
 		}
 
-		atomic.AddInt64(&next.AccessCount, 1)
-		return next.Value, true
+		newHits := atomic.AddInt64(&next.AccessCount, 1)
+		return next.Value, newHits, true
 	}
 
-	return nil, false
+	return nil, 0, false
 }
 
 func (s *SkipList) Iterator(fn func(key string, value []byte, typ byte, accessCount int64) bool) {

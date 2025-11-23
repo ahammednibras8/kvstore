@@ -142,23 +142,24 @@ func (s *Store) Put(key string, value []byte) error {
 	return nil
 }
 
-func (s *Store) Get(key string) ([]byte, bool) {
+func (s *Store) Get(key string) ([]byte, int64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	// 1. Check the MemTable
-	if val, found := s.mem.Get(key); found {
-		return val, true
+	if val, hits, found := s.mem.Get(key); found {
+		return val, hits, true
 	}
 
 	// 2. Check SSTables already sorted
 	for _, filename := range s.sstFiles {
 		if val, found := s.readFromSSTable(filename, key); found {
-			return val, true
+			s.mem.PutSurvivor(key, val, 0, 1)
+			return val, 1, true
 		}
 	}
 
-	return nil, false
+	return nil, 0, false
 }
 
 func (s *Store) Flush() error {
@@ -340,7 +341,7 @@ func (s *Store) AvgAccess() float64 {
 	return s.avgAccess
 }
 
-func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
+func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 	// 1. Open the SSTable (read-only)
 	f, err := os.Open(filename)
 	if err != nil {
@@ -348,44 +349,68 @@ func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 	}
 	defer f.Close()
 
+	// 2. LookUp sparse index for this file
+	sparse := s.sparseIndexes[filename]
+
+	// 3. If Index exists , binary-search to find the correct block
+	if len(sparse) > 0 {
+		idx := sort.Search(len(sparse), func(i int) bool {
+			return sparse[i].Key > targetKey
+		})
+
+		if idx > 0 {
+			idx = idx - 1
+		} else {
+			idx = 0
+		}
+
+		off := sparse[idx].Offset
+
+		// 4. Seek to the start of that block
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			log.Printf("seek failed: %v", err)
+			return nil, false
+		}
+	}
+
+	// 5. Scan Forward normally
 	header := make([]byte, 16)
 
 	for {
-		// 2. Read header: keyLen + valLen
 		_, err := io.ReadFull(f, header)
 		if err == io.EOF {
 			return nil, false
 		}
-		if err == io.ErrUnexpectedEOF {
-			log.Printf("SSTable corruption: partial header encountered - stopping parse")
-			return nil, false
-		}
 		if err != nil {
-			log.Printf("SSTable read error (header): %v", err)
+			log.Printf("SST read error (header): %v", err)
 			return nil, false
 		}
 
 		keyLen := binary.LittleEndian.Uint64(header[0:8])
 		valLen := binary.LittleEndian.Uint64(header[8:16])
 
-		// 3. Read Type byte
 		var typ [1]byte
 		_, err = io.ReadFull(f, typ[:])
 		if err != nil {
-			log.Printf("SSTable read error (type): %v", err)
+			log.Printf("SST read error (type): %v", err)
 			return nil, false
 		}
 
-		// 4. Read the key
 		keyBytes := make([]byte, keyLen)
 		_, err = io.ReadFull(f, keyBytes)
 		if err != nil {
-			log.Printf("SSTable read error (key): %v", err)
+			log.Printf("SST read error (key): %v", err)
+			return nil, false
+		}
+		key := string(keyBytes)
+
+		// 5. Early stopping: SST keys are sorted
+		if key > targetKey {
 			return nil, false
 		}
 
-		// 5. Compare to target key
-		if string(keyBytes) == key {
+		// 6. If Match found
+		if key == targetKey {
 			if typ[0] == 1 {
 				return nil, false
 			}
@@ -393,16 +418,16 @@ func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 			value := make([]byte, valLen)
 			_, err = io.ReadFull(f, value)
 			if err != nil {
-				log.Printf("SSTable read error (value): %v", err)
+				log.Printf("SST read error (value): %v", err)
 				return nil, false
 			}
+
 			return value, true
 		}
 
-		// 6. No Match -> Skip the value bytes
 		_, err = f.Seek(int64(valLen), io.SeekCurrent)
 		if err != nil {
-			log.Printf("SSTable seek error: %v", err)
+			log.Printf("SST seek error: %v", err)
 			return nil, false
 		}
 	}
