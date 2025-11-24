@@ -91,7 +91,7 @@ func (s *SkipList) Put(key string, value []byte) {
 	}
 }
 
-func (s *SkipList) Get(key string) ([]byte, bool) {
+func (s *SkipList) Get(key string) ([]byte, int64, bool) {
 	current := s.Head
 
 	for lvl := s.Level - 1; lvl >= 0; lvl-- {
@@ -104,14 +104,14 @@ func (s *SkipList) Get(key string) ([]byte, bool) {
 
 	if next != nil && next.Key == key {
 		if next.Type == 1 {
-			return nil, false
+			return nil, 0, false
 		}
 
-		atomic.AddInt64(&next.AccessCount, 1)
-		return next.Value, true
+		newHits := atomic.AddInt64(&next.AccessCount, 1)
+		return next.Value, newHits, true
 	}
 
-	return nil, false
+	return nil, 0, false
 }
 
 func (s *SkipList) Iterator(fn func(key string, value []byte, typ byte, accessCount int64) bool) {
@@ -165,6 +165,55 @@ func (s *SkipList) Delete(key string) {
 	}
 
 	// 4. Insert node into all levels
+	for lvl := 0; lvl < newLevel; lvl++ {
+		newNode.Next[lvl] = update[lvl].Next[lvl]
+		update[lvl].Next[lvl] = newNode
+	}
+}
+
+func (s *SkipList) PutSurvivor(key string, value []byte, typ byte, hits int64) {
+	update := make([]*Node, s.MaxLevel)
+	current := s.Head
+
+	// 1. Find insert positions
+	for lvl := s.Level - 1; lvl >= 0; lvl-- {
+		for current.Next[lvl] != nil && current.Next[lvl].Key < key {
+			current = current.Next[lvl]
+		}
+		update[lvl] = current
+	}
+
+	next := current.Next[0]
+
+	// 2. If key exist update existing node
+	if next != nil && next.Key == key {
+		next.Type = typ
+		next.Value = value
+		atomic.StoreInt64(&next.AccessCount, hits)
+		return
+	}
+
+	// 3. Determine new node level
+	newLevel := s.randomLevel()
+
+	// 4. Expand list level if needed
+	if newLevel > s.Level {
+		for lvl := s.Level; lvl < newLevel; lvl++ {
+			update[lvl] = s.Head
+		}
+		s.Level = newLevel
+	}
+
+	// 5. Create Node
+	newNode := &Node{
+		Key:         key,
+		Type:        typ,
+		Value:       value,
+		Next:        make([]*Node, newLevel),
+		AccessCount: hits,
+	}
+
+	// 6. Insert node at all levels
 	for lvl := 0; lvl < newLevel; lvl++ {
 		newNode.Next[lvl] = update[lvl].Next[lvl]
 		update[lvl].Next[lvl] = newNode

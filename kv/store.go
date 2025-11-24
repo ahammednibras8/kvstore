@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"container/heap"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -14,15 +15,48 @@ import (
 )
 
 type Store struct {
-	mem       *skiplist.SkipList
-	log       *wal.WAL
-	avgAccess float64
-	alpha     float64
-	mu        sync.RWMutex
-	walGen    int64
-	sstGen    int64
-	sstFiles  []string
-	sstDir    string
+	mem           *skiplist.SkipList
+	log           *wal.WAL
+	avgAccess     float64
+	alpha         float64
+	mu            sync.RWMutex
+	walGen        int64
+	sstGen        int64
+	sstFiles      []string
+	sstDir        string
+	sparseIndexes map[string][]SparseIndexEntry
+	bloomFilter   map[string]*BloomFilter
+}
+
+type HeapNode struct {
+	Key       string
+	Value     []byte
+	Type      byte
+	FileIndex int
+	Gen       int64
+}
+
+type EntryHeap []*HeapNode
+
+func (h EntryHeap) Len() int { return len(h) }
+func (h EntryHeap) Less(i, j int) bool {
+	if h[i].Key != h[j].Key {
+		return h[i].Key < h[j].Key
+	}
+	return h[i].FileIndex < h[j].FileIndex
+}
+func (h EntryHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+
+func (h *EntryHeap) Push(x interface{}) {
+	*h = append(*h, x.(*HeapNode))
+}
+
+func (h *EntryHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[0 : n-1]
+	return item
 }
 
 func Open(path string) (*Store, error) {
@@ -49,12 +83,14 @@ func Open(path string) (*Store, error) {
 	}
 
 	s := &Store{
-		mem:       mem,
-		log:       w,
-		avgAccess: 0,
-		alpha:     0.4,
-		sstFiles:  []string{},
-		sstGen:    0,
+		mem:           mem,
+		log:           w,
+		avgAccess:     0,
+		alpha:         0.4,
+		sstFiles:      []string{},
+		sstGen:        0,
+		sparseIndexes: make(map[string][]SparseIndexEntry),
+		bloomFilter:   make(map[string]*BloomFilter),
 	}
 
 	// 4. Discover existing SST files
@@ -86,7 +122,89 @@ func Open(path string) (*Store, error) {
 
 	s.sstFiles = files
 
+	// Track highest generation
+	for _, f := range files {
+		g := parseGen(f)
+		if g > s.sstGen {
+			s.sstGen = g
+		}
+	}
+
 	log.Printf("Loaded %d SST files (newest→oldest). Highest generation = %d", len(s.sstFiles), s.sstGen)
+
+	// REBUILD bloom filter + sparse index for every SST file
+	for _, filename := range files {
+		f, err := os.Open(filename)
+		if err != nil {
+			return nil, fmt.Errorf("open sst %s: %w", filename, err)
+		}
+
+		// Conservative estimate: size / 100 bytes per record
+		info, _ := f.Stat()
+		estimatedN := int(info.Size() / 100)
+		if estimatedN < 1 {
+			estimatedN = 1
+		}
+		bf := NewBloomFilter(estimatedN, 0.01)
+
+		var sparse []SparseIndexEntry
+		const blockSize int64 = 1024
+		var lastIndexPos int64 = 0
+
+		offset := int64(0)
+
+		for {
+			header := make([]byte, 16)
+			_, err := io.ReadFull(f, header)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				f.Close()
+				return nil, fmt.Errorf("sst read header: %w", err)
+			}
+
+			keyLen := binary.LittleEndian.Uint64(header[0:8])
+			valLen := binary.LittleEndian.Uint64(header[8:16])
+
+			var typ [1]byte
+			if _, err := io.ReadFull(f, typ[:]); err != nil {
+				f.Close()
+				return nil, err
+			}
+
+			keyBytes := make([]byte, keyLen)
+			if _, err := io.ReadFull(f, keyBytes); err != nil {
+				f.Close()
+				return nil, err
+			}
+			key := string(keyBytes)
+
+			// Skip Value
+			if _, err := f.Seek(int64(valLen), io.SeekCurrent); err != nil {
+				f.Close()
+				return nil, err
+			}
+
+			// Add to Bloom Filter (tombstones INCLUDED)
+			bf.Add(key)
+
+			// Sparse index insertion
+			if offset-lastIndexPos >= blockSize {
+				sparse = append(sparse, SparseIndexEntry{
+					Key:    key,
+					Offset: offset,
+				})
+				lastIndexPos = offset
+			}
+
+			offset, _ = f.Seek(0, io.SeekCurrent)
+		}
+
+		s.bloomFilter[filename] = bf
+		s.sparseIndexes[filename] = sparse
+		f.Close()
+	}
 
 	return s, nil
 }
@@ -108,23 +226,24 @@ func (s *Store) Put(key string, value []byte) error {
 	return nil
 }
 
-func (s *Store) Get(key string) ([]byte, bool) {
+func (s *Store) Get(key string) ([]byte, int64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	// 1. Check the MemTable
-	if val, found := s.mem.Get(key); found {
-		return val, true
+	if val, hits, found := s.mem.Get(key); found {
+		return val, hits, true
 	}
 
 	// 2. Check SSTables already sorted
 	for _, filename := range s.sstFiles {
 		if val, found := s.readFromSSTable(filename, key); found {
-			return val, true
+			s.mem.PutSurvivor(key, val, 0, 1)
+			return val, 1, true
 		}
 	}
 
-	return nil, false
+	return nil, 0, false
 }
 
 func (s *Store) Flush() error {
@@ -149,6 +268,13 @@ func (s *Store) Flush() error {
 	}
 
 	s.avgAccess = (s.alpha * currentMean) + ((1 - s.alpha) * s.avgAccess)
+
+	// Create Bloom Filter
+	estimatedN := int(count)
+	if estimatedN < 1 {
+		estimatedN = 1
+	}
+	bf := NewBloomFilter(estimatedN, 0.01)
 
 	// 1. Create new MemTable + WAL
 	newMem := skiplist.NewSkipList(0.5, 16)
@@ -176,15 +302,32 @@ func (s *Store) Flush() error {
 		return fmt.Errorf("open tmp sst: %w", err)
 	}
 
+	// sparse index setup
+	var sparse []SparseIndexEntry
+	var lastIndexPos int64 = 0
+	const blockSize int64 = 1024
+
+	var lastKeyWritten string
+
 	// 3. Iterate through OLD memtable and migrate
 	err = func() error {
 		var iterErr error
 		s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
+			if key == lastKeyWritten {
+				return true
+			}
+			lastKeyWritten = key
+
 			if float64(accessCount) > s.avgAccess {
+				// Momentum Decay
+				decayFactor := 0.5
+				decayHits := max(int64(float64(accessCount)*decayFactor), 1)
+
+				// Insert into new MemTable with momentum
 				if typ == 1 {
-					newMem.Delete(key)
+					newMem.PutSurvivor(key, nil, 1, decayHits)
 				} else {
-					newMem.Put(key, value)
+					newMem.PutSurvivor(key, value, 0, decayHits)
 				}
 
 				if werr := newWal.Write(wal.Entry{
@@ -196,35 +339,49 @@ func (s *Store) Flush() error {
 					return false
 				}
 				return true
-			} else {
-				header := make([]byte, 16)
-				binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
-				binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
+			}
 
-				// a. write header
-				if _, werr := sstTmp.Write(header); werr != nil {
+			// Before wrinting entry get offset
+			offset, _ := sstTmp.Seek(0, io.SeekCurrent)
+			if offset-lastIndexPos >= blockSize {
+				sparse = append(sparse, SparseIndexEntry{
+					Key:    key,
+					Offset: offset,
+				})
+				lastIndexPos = offset
+			}
+
+			// Add Key to Bloom Fileter
+			bf.Add(key)
+
+			// Write SST Enrtry
+			header := make([]byte, 16)
+			binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
+			binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
+
+			// a. write header
+			if _, werr := sstTmp.Write(header); werr != nil {
+				iterErr = werr
+				return false
+			}
+
+			// b. write Type byte (0 = PUT, 1 = DELETE)
+			if _, werr := sstTmp.Write([]byte{typ}); werr != nil {
+				iterErr = werr
+				return false
+			}
+
+			// c. write Key
+			if _, werr := sstTmp.Write([]byte(key)); werr != nil {
+				iterErr = werr
+				return false
+			}
+
+			// d. write Value
+			if value != nil {
+				if _, werr := sstTmp.Write(value); werr != nil {
 					iterErr = werr
 					return false
-				}
-
-				// b. write Type byte (0 = PUT, 1 = DELETE)
-				if _, werr := sstTmp.Write([]byte{typ}); werr != nil {
-					iterErr = werr
-					return false
-				}
-
-				// c. write Key
-				if _, werr := sstTmp.Write([]byte(key)); werr != nil {
-					iterErr = werr
-					return false
-				}
-
-				// d. write Value
-				if value != nil {
-					if _, werr := sstTmp.Write(value); werr != nil {
-						iterErr = werr
-						return false
-					}
 				}
 			}
 			return true
@@ -255,9 +412,12 @@ func (s *Store) Flush() error {
 	// 5. Atomically replace store.sst with the temp file
 	if err := os.Rename(tmpSST, finalSST); err != nil {
 		cleanupNewWal()
-		_ = os.Remove(tmpSST)
 		return fmt.Errorf("rename tmp sst: %w", err)
 	}
+
+	s.sparseIndexes[finalSST] = sparse
+	// Save the bloom Fileter for SST file
+	s.bloomFilter[finalSST] = bf
 	s.sstFiles = append([]string{finalSST}, s.sstFiles...)
 
 	// 6. Swap old WAL/mem with new ones (we hold the store lock)
@@ -284,7 +444,7 @@ func (s *Store) AvgAccess() float64 {
 	return s.avgAccess
 }
 
-func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
+func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 	// 1. Open the SSTable (read-only)
 	f, err := os.Open(filename)
 	if err != nil {
@@ -292,44 +452,76 @@ func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 	}
 	defer f.Close()
 
+	// Bloom Filter Check
+	bf := s.bloomFilter[filename]
+	if bf != nil {
+		if !bf.Contains(targetKey) {
+			return nil, false
+		}
+	}
+
+	// 2. LookUp sparse index for this file
+	sparse := s.sparseIndexes[filename]
+
+	// 3. If Index exists , binary-search to find the correct block
+	if len(sparse) > 0 {
+		idx := sort.Search(len(sparse), func(i int) bool {
+			return sparse[i].Key > targetKey
+		})
+
+		if idx > 0 {
+			idx = idx - 1
+		} else {
+			idx = 0
+		}
+
+		off := sparse[idx].Offset
+
+		// 4. Seek to the start of that block
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
+			log.Printf("seek failed: %v", err)
+			return nil, false
+		}
+	}
+
+	// 5. Scan Forward normally
 	header := make([]byte, 16)
 
 	for {
-		// 2. Read header: keyLen + valLen
 		_, err := io.ReadFull(f, header)
 		if err == io.EOF {
 			return nil, false
 		}
-		if err == io.ErrUnexpectedEOF {
-			log.Printf("SSTable corruption: partial header encountered - stopping parse")
-			return nil, false
-		}
 		if err != nil {
-			log.Printf("SSTable read error (header): %v", err)
+			log.Printf("SST read error (header): %v", err)
 			return nil, false
 		}
 
 		keyLen := binary.LittleEndian.Uint64(header[0:8])
 		valLen := binary.LittleEndian.Uint64(header[8:16])
 
-		// 3. Read Type byte
 		var typ [1]byte
 		_, err = io.ReadFull(f, typ[:])
 		if err != nil {
-			log.Printf("SSTable read error (type): %v", err)
+			log.Printf("SST read error (type): %v", err)
 			return nil, false
 		}
 
-		// 4. Read the key
 		keyBytes := make([]byte, keyLen)
 		_, err = io.ReadFull(f, keyBytes)
 		if err != nil {
-			log.Printf("SSTable read error (key): %v", err)
+			log.Printf("SST read error (key): %v", err)
+			return nil, false
+		}
+		key := string(keyBytes)
+
+		// 5. Early stopping: SST keys are sorted
+		if key > targetKey {
 			return nil, false
 		}
 
-		// 5. Compare to target key
-		if string(keyBytes) == key {
+		// 6. If Match found
+		if key == targetKey {
 			if typ[0] == 1 {
 				return nil, false
 			}
@@ -337,16 +529,16 @@ func (s *Store) readFromSSTable(filename, key string) ([]byte, bool) {
 			value := make([]byte, valLen)
 			_, err = io.ReadFull(f, value)
 			if err != nil {
-				log.Printf("SSTable read error (value): %v", err)
+				log.Printf("SST read error (value): %v", err)
 				return nil, false
 			}
+
 			return value, true
 		}
 
-		// 6. No Match -> Skip the value bytes
 		_, err = f.Seek(int64(valLen), io.SeekCurrent)
 		if err != nil {
-			log.Printf("SSTable seek error: %v", err)
+			log.Printf("SST seek error: %v", err)
 			return nil, false
 		}
 	}
@@ -365,7 +557,192 @@ func (s *Store) Delete(key string) error {
 		return err
 	}
 
-	s.mem.Delete(key)
+	s.mem.PutSurvivor(key, nil, 1, 0)
+
+	return nil
+}
+
+func readNextEntry(f *os.File) (*HeapNode, error) {
+	header := make([]byte, 16)
+
+	_, err := io.ReadFull(f, header)
+	if err != nil {
+		return nil, err
+	}
+
+	keyLen := binary.LittleEndian.Uint64(header[0:8])
+	valLen := binary.LittleEndian.Uint64(header[8:16])
+
+	var typ [1]byte
+	if _, err := io.ReadFull(f, typ[:]); err != nil {
+		return nil, err
+	}
+
+	key := make([]byte, keyLen)
+	if _, err := io.ReadFull(f, key); err != nil {
+		return nil, err
+	}
+
+	value := make([]byte, valLen)
+	if valLen > 0 {
+		if _, err := io.ReadFull(f, value); err != nil {
+			return nil, err
+		}
+	}
+
+	return &HeapNode{
+		Key:   string(key),
+		Value: value,
+		Type:  typ[0],
+	}, nil
+}
+
+func writeSSTEntry(out *os.File, n *HeapNode) error {
+	header := make([]byte, 16)
+	binary.LittleEndian.PutUint64(header[0:8], uint64(len(n.Key)))
+	binary.LittleEndian.PutUint64(header[8:16], uint64(len(n.Value)))
+
+	if _, err := out.Write(header); err != nil {
+		return err
+	}
+	if _, err := out.Write([]byte{n.Type}); err != nil {
+		return err
+	}
+	if _, err := out.Write([]byte(n.Key)); err != nil {
+		return err
+	}
+	if _, err := out.Write(n.Value); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *Store) Compact() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	inputFiles := s.sstFiles
+	if len(inputFiles) < 2 {
+		return nil
+	}
+
+	// 1. Estimate Bloom Filter size
+	var totalSize int64
+	for _, f := range inputFiles {
+		info, err := os.Stat(f)
+		if err == nil {
+			totalSize += info.Size()
+		}
+	}
+
+	// Assume ~100 bytes per entry
+	estimatedN := int(totalSize / 100)
+	if estimatedN < 1 {
+		estimatedN = 1
+	}
+
+	// 2. Open SST files and build initial heap
+	readers := make([]*os.File, len(inputFiles))
+	h := &EntryHeap{}
+	heap.Init(h)
+
+	for i, filename := range inputFiles {
+		f, err := os.Open(filename)
+		if err != nil {
+			return err
+		}
+		readers[i] = f
+
+		if node, err := readNextEntry(f); err == nil {
+			node.FileIndex = i
+			node.Gen = int64(i)
+			heap.Push(h, node)
+		}
+	}
+
+	// 3. Create output SST (temp)
+	s.sstGen++
+	outName := fmt.Sprintf("sst-%d.sst", s.sstGen)
+	tmpName := outName + ".tmp"
+
+	out, err := os.Create(tmpName)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+
+	// Create Bloom Filter for new file
+	bf := NewBloomFilter(estimatedN, 0.01)
+
+	var lastkey string
+
+	// Sparse Index Setup
+	var sparse []SparseIndexEntry
+	var lastIndexPos int64 = 0
+	const blockSize int64 = 1024
+
+	// 4. K-way merge loop
+	for h.Len() > 0 {
+		minNode := heap.Pop(h).(*HeapNode)
+
+		if minNode.Key != lastkey {
+			// Add key to Bloom Filter — EVEN tombstones
+			bf.Add(minNode.Key)
+
+			if minNode.Type == 0 {
+				offset, _ := out.Seek(0, io.SeekCurrent)
+				if offset-lastIndexPos >= blockSize {
+					sparse = append(sparse, SparseIndexEntry{
+						Key:    minNode.Key,
+						Offset: offset,
+					})
+					lastIndexPos = offset
+				}
+
+				if err := writeSSTEntry(out, minNode); err != nil {
+					return err
+				}
+			}
+			lastkey = minNode.Key
+		}
+
+		if nextNode, err := readNextEntry(readers[minNode.FileIndex]); err == nil {
+			nextNode.FileIndex = minNode.FileIndex
+			nextNode.Gen = minNode.Gen
+			heap.Push(h, nextNode)
+		}
+	}
+
+	// 5. Sync + close output
+	if err := out.Sync(); err != nil {
+		return err
+	}
+	out.Close()
+
+	// 6. Replace SST list
+	if err := os.Rename(tmpName, outName); err != nil {
+		return err
+	}
+
+	oldFile := inputFiles
+	s.sstFiles = []string{outName}
+
+	// Save Sparse Index
+	s.sparseIndexes[outName] = sparse
+
+	s.bloomFilter[outName] = bf
+
+	// 7. Delete all old SST files
+	for _, f := range oldFile {
+		if err := os.Remove(f); err != nil {
+			log.Printf("warning: failed to delete old SST %s: %v", f, err)
+		}
+
+		// Remove stale metadata to prevent memory leak
+		delete(s.sparseIndexes, f)
+		delete(s.bloomFilter, f)
+	}
 
 	return nil
 }
