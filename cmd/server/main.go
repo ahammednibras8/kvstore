@@ -118,5 +118,24 @@ func main() {
 		w.Write(store.Metrics().ToJSON())
 	})
 
+	http.HandleFunc("/scan", func(w http.ResponseWriter, r *http.Request) {
+		start := r.URL.Query().Get("start")
+		end := r.URL.Query().Get("end")
+
+		if start == "" || end == "" {
+			http.Error(w, "start and end required", 400)
+			return
+		}
+
+		results, err := store.Scan(start, end)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(results)
+	})
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }

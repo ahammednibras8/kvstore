@@ -219,3 +219,25 @@ func (s *SkipList) PutSurvivor(key string, value []byte, typ byte, hits int64) {
 		update[lvl].Next[lvl] = newNode
 	}
 }
+
+func (s *SkipList) RangeScan(start, end string) []*Node {
+	var nodes []*Node
+	current := s.Head
+
+	// 1. Traverse to the starting point
+	for lvl := s.Level - 1; lvl >= 0; lvl-- {
+		for current.Next[lvl] != nil && current.Next[lvl].Key < start {
+			current = current.Next[lvl]
+		}
+	}
+
+	current = current.Next[0]
+
+	// 2. Collect keys until we hit end
+	for current != nil && current.Key < end {
+		nodes = append(nodes, current)
+		current = current.Next[0]
+	}
+
+	return nodes
+}
