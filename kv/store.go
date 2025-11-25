@@ -28,6 +28,7 @@ type Store struct {
 	sparseIndexes map[string][]SparseIndexEntry
 	bloomFilter   map[string]*BloomFilter
 	metrics       *Metrics
+	frozen        *skiplist.SkipList
 }
 
 type HeapNode struct {
@@ -254,7 +255,17 @@ func (s *Store) Get(key string) ([]byte, int64, bool) {
 		return val, hits, true
 	}
 
-	// 2. Check SSTables already sorted
+	// 2. Check the frozen MemTable
+	if s.frozen != nil {
+		if val, hits, found := s.frozen.Get(key); found {
+			if s.metrics != nil {
+				atomic.AddInt64(&s.metrics.MemtableHits, 1)
+			}
+			return val, hits, true
+		}
+	}
+
+	// 3. Check SSTables already sorted
 	for _, filename := range s.sstFiles {
 		if val, found := s.readFromSSTable(filename, key); found {
 			s.mem.PutSurvivor(key, val, 0, 1)
@@ -266,18 +277,36 @@ func (s *Store) Get(key string) ([]byte, int64, bool) {
 }
 
 func (s *Store) Flush() error {
+	// PHASE 1 — SWAP
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	if s.metrics != nil {
-		atomic.AddInt64(&s.metrics.Flushes, 1)
+	if s.frozen != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("flush already in progress")
 	}
 
-	// A. Calculate instantaneous average access count
+	frozen := s.mem
+	s.frozen = frozen
+	s.mem = skiplist.NewSkipList(0.5, 16)
+
+	oldWal := s.log
+	s.walGen++
+	newWal, err := wal.Open(fmt.Sprintf("wal-%d.log", s.walGen))
+	if err != nil {
+		s.mem = frozen
+		s.frozen = nil
+		s.mu.Unlock()
+		return err
+	}
+	s.log = newWal
+
+	s.mu.Unlock()
+
+	// PHASE 2 — WRITE FROZEN
 	var sum float64
 	var count float64
 
-	s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
+	frozen.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 		sum += float64(accessCount)
 		count++
 		return true
@@ -286,85 +315,58 @@ func (s *Store) Flush() error {
 	var currentMean float64
 	if count > 0 {
 		currentMean = sum / count
-	} else {
-		currentMean = 0
 	}
 
-	s.avgAccess = (s.alpha * currentMean) + ((1 - s.alpha) * s.avgAccess)
-
-	// Create Bloom Filter
 	estimatedN := int(count)
 	if estimatedN < 1 {
 		estimatedN = 1
 	}
 	bf := NewBloomFilter(estimatedN, 0.01)
 
-	// 1. Create new MemTable + WAL
-	newMem := skiplist.NewSkipList(0.5, 16)
-
-	s.walGen++
-	walFilename := fmt.Sprintf("wal-%d.log", s.walGen)
-
-	newWal, err := wal.Open(walFilename)
-	if err != nil {
-		return err
-	}
-
-	cleanupNewWal := func() {
-		_ = newWal.Close()
-	}
-
-	// 2. Create SST filename (level 0 style)
 	s.sstGen++
 	finalSST := fmt.Sprintf("sst-%d.sst", s.sstGen)
 	tmpSST := finalSST + ".temp"
 
 	sstTmp, err := os.OpenFile(tmpSST, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		cleanupNewWal()
 		return fmt.Errorf("open tmp sst: %w", err)
 	}
 
-	// sparse index setup
+	// sparse index setup (unchanged)
 	var sparse []SparseIndexEntry
 	var lastIndexPos int64 = 0
 	const blockSize int64 = 1024
 
 	var lastKeyWritten string
 
-	// 3. Iterate through OLD memtable and migrate
+	// iterate frozen memtable now
 	err = func() error {
 		var iterErr error
-		s.mem.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
+		frozen.Iterator(func(key string, value []byte, typ byte, accessCount int64) bool {
 			if key == lastKeyWritten {
 				return true
 			}
 			lastKeyWritten = key
 
-			if float64(accessCount) > s.avgAccess {
-				// Momentum Decay
-				decayFactor := 0.5
-				decayHits := max(int64(float64(accessCount)*decayFactor), 1)
+			if float64(accessCount) > currentMean {
+				decay := max(int64(float64(accessCount) * 0.5), 1)
 
-				// Insert into new MemTable with momentum
+				s.mu.Lock()
 				if typ == 1 {
-					newMem.PutSurvivor(key, nil, 1, decayHits)
+					s.mem.PutSurvivor(key, nil, 1, decay)
 				} else {
-					newMem.PutSurvivor(key, value, 0, decayHits)
+					s.mem.PutSurvivor(key, value, 0, decay)
 				}
+				werr := s.log.Write(wal.Entry{Type: typ, Key: []byte(key), Value: value})
+				s.mu.Unlock()
 
-				if werr := newWal.Write(wal.Entry{
-					Type:  typ,
-					Key:   []byte(key),
-					Value: value,
-				}); werr != nil {
+				if werr != nil {
 					iterErr = werr
 					return false
 				}
 				return true
 			}
 
-			// Before wrinting entry get offset
 			offset, _ := sstTmp.Seek(0, io.SeekCurrent)
 			if offset-lastIndexPos >= blockSize {
 				sparse = append(sparse, SparseIndexEntry{
@@ -374,33 +376,27 @@ func (s *Store) Flush() error {
 				lastIndexPos = offset
 			}
 
-			// Add Key to Bloom Fileter
 			bf.Add(key)
 
-			// Write SST Enrtry
 			header := make([]byte, 16)
 			binary.LittleEndian.PutUint64(header[0:8], uint64(len(key)))
 			binary.LittleEndian.PutUint64(header[8:16], uint64(len(value)))
 
-			// a. write header
 			if _, werr := sstTmp.Write(header); werr != nil {
 				iterErr = werr
 				return false
 			}
 
-			// b. write Type byte (0 = PUT, 1 = DELETE)
 			if _, werr := sstTmp.Write([]byte{typ}); werr != nil {
 				iterErr = werr
 				return false
 			}
 
-			// c. write Key
 			if _, werr := sstTmp.Write([]byte(key)); werr != nil {
 				iterErr = werr
 				return false
 			}
 
-			// d. write Value
 			if value != nil {
 				if _, werr := sstTmp.Write(value); werr != nil {
 					iterErr = werr
@@ -413,50 +409,42 @@ func (s *Store) Flush() error {
 	}()
 
 	if err != nil {
-		cleanupNewWal()
 		_ = sstTmp.Close()
 		_ = os.Remove(tmpSST)
 		return fmt.Errorf("migration error: %w", err)
 	}
 
-	// 4. Ensure temp file is flushed to disk and closed
 	if err := sstTmp.Sync(); err != nil {
-		cleanupNewWal()
 		_ = sstTmp.Close()
 		_ = os.Remove(tmpSST)
 		return fmt.Errorf("sync tmp sst: %w", err)
 	}
 	if err := sstTmp.Close(); err != nil {
-		cleanupNewWal()
 		_ = os.Remove(tmpSST)
 		return fmt.Errorf("close tmp sst: %w", err)
 	}
 
-	// 5. Atomically replace store.sst with the temp file
 	if err := os.Rename(tmpSST, finalSST); err != nil {
-		cleanupNewWal()
 		return fmt.Errorf("rename tmp sst: %w", err)
 	}
 
 	s.sparseIndexes[finalSST] = sparse
-	// Save the bloom Fileter for SST file
 	s.bloomFilter[finalSST] = bf
 	s.sstFiles = append([]string{finalSST}, s.sstFiles...)
 
-	// 6. Swap old WAL/mem with new ones (we hold the store lock)
-	oldWal := s.log
-	s.mem = newMem
-	s.log = newWal
+	// PHASE 3 — COMMIT
+	s.mu.Lock()
+	s.avgAccess = (s.alpha * currentMean) + ((1 - s.alpha) * s.avgAccess)
+	s.frozen = nil
 
-	if oldWal != nil {
-		if cerr := oldWal.Close(); cerr != nil {
-			log.Printf("warning: failed to close old wal: %v", cerr)
-		}
-
-		if oldPath := oldWal.Path(); oldPath != "" {
-			_ = os.Remove(oldPath)
-		}
+	if s.metrics != nil {
+		atomic.AddInt64(&s.metrics.Flushes, 1)
 	}
+
+	s.mu.Unlock()
+
+	oldWal.Close()
+	os.Remove(oldWal.Path())
 
 	return nil
 }
