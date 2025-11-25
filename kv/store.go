@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 )
 
 type Store struct {
@@ -26,6 +27,7 @@ type Store struct {
 	sstDir        string
 	sparseIndexes map[string][]SparseIndexEntry
 	bloomFilter   map[string]*BloomFilter
+	metrics       *Metrics
 }
 
 type HeapNode struct {
@@ -91,6 +93,7 @@ func Open(path string) (*Store, error) {
 		sstGen:        0,
 		sparseIndexes: make(map[string][]SparseIndexEntry),
 		bloomFilter:   make(map[string]*BloomFilter),
+		metrics:       NewMetrics(),
 	}
 
 	// 4. Discover existing SST files
@@ -213,6 +216,10 @@ func (s *Store) Put(key string, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.metrics != nil {
+		atomic.AddInt64(&s.metrics.PutCount, 1)
+	}
+
 	err := s.log.Write(wal.Entry{
 		Type:  0,
 		Key:   []byte(key),
@@ -230,8 +237,15 @@ func (s *Store) Get(key string) ([]byte, int64, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if s.metrics != nil {
+		atomic.AddInt64(&s.metrics.GetCount, 1)
+	}
+
 	// 1. Check the MemTable
 	if val, hits, found := s.mem.Get(key); found {
+		if s.metrics != nil {
+			atomic.AddInt64(&s.metrics.MemtableHits, 1)
+		}
 		return val, hits, true
 	}
 
@@ -249,6 +263,10 @@ func (s *Store) Get(key string) ([]byte, int64, bool) {
 func (s *Store) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.metrics != nil {
+		atomic.AddInt64(&s.metrics.Flushes, 1)
+	}
 
 	// A. Calculate instantaneous average access count
 	var sum float64
@@ -456,6 +474,9 @@ func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 	bf := s.bloomFilter[filename]
 	if bf != nil {
 		if !bf.Contains(targetKey) {
+			if s.metrics != nil {
+				atomic.AddInt64(&s.metrics.BloomHits, 1)
+			}
 			return nil, false
 		}
 	}
@@ -477,9 +498,23 @@ func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 
 		off := sparse[idx].Offset
 
+		if s.metrics != nil {
+			atomic.AddInt64(&s.metrics.DiskReads, 1)
+		}
+
 		// 4. Seek to the start of that block
 		if _, err := f.Seek(off, io.SeekStart); err != nil {
 			log.Printf("seek failed: %v", err)
+			return nil, false
+		}
+	} else {
+		// No sparse index — we will read from start. Count as disk read.
+		if s.metrics != nil {
+			atomic.AddInt64(&s.metrics.DiskReads, 1)
+		}
+
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			log.Printf("seek to start failed: %v", err)
 			return nil, false
 		}
 	}
@@ -490,6 +525,9 @@ func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 	for {
 		_, err := io.ReadFull(f, header)
 		if err == io.EOF {
+			if s.metrics != nil {
+				atomic.AddInt64(&s.metrics.SSTableMiss, 1)
+			}
 			return nil, false
 		}
 		if err != nil {
@@ -517,12 +555,18 @@ func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 
 		// 5. Early stopping: SST keys are sorted
 		if key > targetKey {
+			if s.metrics != nil {
+				atomic.AddInt64(&s.metrics.SSTableMiss, 1)
+			}
 			return nil, false
 		}
 
 		// 6. If Match found
 		if key == targetKey {
 			if typ[0] == 1 {
+				if s.metrics != nil {
+					atomic.AddInt64(&s.metrics.SSTableMiss, 1)
+				}
 				return nil, false
 			}
 
@@ -531,6 +575,10 @@ func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 			if err != nil {
 				log.Printf("SST read error (value): %v", err)
 				return nil, false
+			}
+
+			if s.metrics != nil {
+				atomic.AddInt64(&s.metrics.SSTableHits, 1)
 			}
 
 			return value, true
@@ -547,6 +595,10 @@ func (s *Store) readFromSSTable(filename, targetKey string) ([]byte, bool) {
 func (s *Store) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.metrics != nil {
+		atomic.AddInt64(&s.metrics.DeleteCount, 1)
+	}
 
 	err := s.log.Write(wal.Entry{
 		Type:  1,
@@ -621,6 +673,10 @@ func writeSSTEntry(out *os.File, n *HeapNode) error {
 func (s *Store) Compact() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.metrics != nil {
+		atomic.AddInt64(&s.metrics.Compactions, 1)
+	}
 
 	inputFiles := s.sstFiles
 	if len(inputFiles) < 2 {
@@ -745,4 +801,8 @@ func (s *Store) Compact() error {
 	}
 
 	return nil
+}
+
+func (s *Store) Metrics() *Metrics {
+	return s.metrics
 }
