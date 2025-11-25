@@ -38,6 +38,11 @@ type HeapNode struct {
 	Gen       int64
 }
 
+type KeyValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
 type EntryHeap []*HeapNode
 
 func (h EntryHeap) Len() int { return len(h) }
@@ -805,4 +810,108 @@ func (s *Store) Compact() error {
 
 func (s *Store) Metrics() *Metrics {
 	return s.metrics
+}
+
+func (s *Store) Scan(start, end string) ([]KeyValue, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	// 1. Build Min-Heap
+	h := &EntryHeap{}
+	heap.Init(h)
+
+	// MEMTABLE SOURCE (priority = -1)
+	memNodes := s.mem.RangeScan(start, end)
+	for _, n := range memNodes {
+		heap.Push(h, &HeapNode{
+			Key:       n.Key,
+			Value:     n.Value,
+			Type:      n.Type,
+			FileIndex: -1,
+		})
+	}
+
+	// SSTABLE SOURCES
+	readers := make([]*os.File, len(s.sstFiles))
+	defer func() {
+		for _, f := range readers {
+			if f != nil {
+				f.Close()
+			}
+		}
+	}()
+
+	for i, filename := range s.sstFiles {
+		f, err := os.Open(filename)
+		if err != nil {
+			return nil, err
+		}
+		readers[i] = f
+
+		sparse := s.sparseIndexes[filename]
+		seekOffset := int64(0)
+
+		if len(sparse) > 0 {
+			idx := sort.Search(len(sparse), func(j int) bool {
+				return sparse[j].Key > start
+			})
+			if idx > 0 {
+				seekOffset = sparse[idx-1].Offset
+			}
+		}
+
+		f.Seek(seekOffset, io.SeekStart)
+
+		for {
+			node, err := readNextEntry(f)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+
+			if node.Key >= end {
+				break
+			}
+
+			if node.Key >= start {
+				node.FileIndex = i
+				heap.Push(h, node)
+				break
+			}
+		}
+	}
+
+	// 3. Merge Loop
+	var results []KeyValue
+	var lastKey string
+
+	for h.Len() > 0 {
+		minNode := heap.Pop(h).(*HeapNode)
+
+		if minNode.Key != lastKey {
+			if minNode.Type == 0 {
+				results = append(results, KeyValue{
+					Key:   minNode.Key,
+					Value: string(minNode.Value),
+				})
+			}
+			lastKey = minNode.Key
+		}
+
+		// Advance SST stream
+		if minNode.FileIndex != -1 {
+			f := readers[minNode.FileIndex]
+			nextNode, err := readNextEntry(f)
+			if err == nil {
+				if nextNode.Key < end {
+					nextNode.FileIndex = minNode.FileIndex
+					heap.Push(h, nextNode)
+				}
+			}
+		}
+	}
+
+	return results, nil
 }
