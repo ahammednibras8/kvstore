@@ -113,5 +113,10 @@ func main() {
 		fmt.Fprintf(w, "Compaction Complete.\n")
 	})
 
+	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(store.Metrics().ToJSON())
+	})
+
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
